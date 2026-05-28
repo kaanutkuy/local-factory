@@ -256,6 +256,13 @@ fi
 BUNDLE_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUNDLE_DIR"' EXIT
 
+# Write a task-run boundary marker to memory/log.md before capturing the
+# recent-log window. The marker delineates "this run starts here" so the
+# builder can tell the difference between feedback from this run and stale
+# CONVERGED entries left by earlier runs of the same (or another) task.
+TASK_TIMESTAMP="$(date "+%Y-%m-%dT%H:%M:%S")"
+printf '\n## task: %s @ %s\n\n' "$TASK_NAME" "$TASK_TIMESTAMP" >> "$LOG"
+
 TASK_TEXT="$(cat "$TASK_FILE")"
 VIS_SCEN="$(read_visible_scenarios)"
 HOLD_SCEN="$(read_holdout_scenarios)"
@@ -285,7 +292,15 @@ ${TASK_TEXT}
 Visible scenarios (builder may read):
 ${VIS_SCEN}
 
-Recent factory log (carries judge feedback from prior iterations):
+Recent factory log (carries judge feedback from prior iterations). The
+"## task: ${TASK_NAME} @ ${TASK_TIMESTAMP}" line near the bottom is the
+boundary for THIS run. Anything above that boundary — including any
+"CONVERGED" entries — is historical: it describes earlier runs against
+possibly different holdouts. It is NOT proof that the current code passes
+the current holdout. Do not skip work on the basis of stale convergence.
+The only feedback that authorizes you to make no change is feedback
+written BELOW that boundary, in this run.
+
 ${RECENT}
 
 When you are done editing, write ONE LINE to factory/memory/log.md describing
