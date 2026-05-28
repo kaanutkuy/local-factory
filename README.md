@@ -28,6 +28,57 @@ empirically, because the seed task was too easy. Consider the project
 *alpha*: the bones are real, the load-bearing parts are tested, the
 hard-task evidence is still ahead.
 
+## Origins: the dark factory, adapted for the solo developer
+
+The pattern this implements is inspired by [StrongDM's Software
+Factory](https://www.strongdm.com/blog/the-strongdm-software-factory-building-software-with-ai)
+— what Dan Shapiro called the [Dark
+Factory](https://simonwillison.net/2026/Feb/7/software-factory/) level of
+AI adoption: a team where humans write the specifications and judge the
+outcomes, and the agents do everything in between, including writing and
+reviewing the code. StrongDM's two load-bearing rules:
+
+1. **Code is not written by humans.**
+2. **Code is not reviewed by humans.**
+
+What humans do instead: define intent (what the system should do, the
+scenarios it has to handle), and judge results through sealed,
+behavior-based evaluation. The critical safeguard is that the AI does not
+see the evaluation criteria while building — only the visible
+specification. StrongDM stores a *holdout set* of scenarios separately so
+the agent has to actually solve the problem rather than memorize the test
+— the same way a holdout set in machine learning verifies that a model
+generalized rather than memorized.
+
+`local-factory` adopts those two rules and the holdout pattern, but
+adapts them for solo developers running on their own machine. Four
+deliberate departures:
+
+- **No digital twins.** StrongDM runs behavioral clones of every
+  third-party API the software integrates with (Okta, Slack, Drive, etc.)
+  in a parallel *Digital Twin Universe*, so agents can hit real-looking
+  endpoints with no rate limits or production risk. That's heavy
+  infrastructure for one person. Here, the judge exercises the real
+  program directly via `VALIDATE_CMD`. A solo developer who needs external
+  integrations should mock or stub them at the seam, not build a twin.
+- **Approve-before-commit, not approve-after-merge.** With a team, the
+  human review can sit at the merge boundary. With a solo developer
+  running unattended sessions, an unattended commit (especially a force
+  push or history rewrite) is one of the few truly irrecoverable actions.
+  The loop here never commits — it stages and stops; the human reviews
+  and commits manually. See [Safety boundaries](#safety-boundaries).
+- **No triad of engineers.** StrongDM has three engineers writing specs
+  and judging outcomes; the cross-check is built into the headcount. The
+  solo developer is one person doing all three roles, which means specs
+  and scenarios can encode the same blind spots. The strongest mitigation
+  available is the holdout itself: if you write the holdout in a separate
+  pass from the visible spec (ideally on a different day), you reduce —
+  not eliminate — the chance of missing the same case twice.
+- **Local-only, no cloud orchestration.** Everything is files on disk and
+  one shell script. No queues, no workers, no scheduler, no dashboard.
+  Easier to understand, easier to interrupt, harder to scale beyond one
+  developer and one machine — by design.
+
 ## Why
 
 Two problems with the usual "LLM writes the code, tests verify it" loop:
