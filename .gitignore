@@ -1,0 +1,10 @@
+# Per-run state — recreated by each loop invocation.
+factory/runs/state.json
+
+# Holdout-write sentinel. Should never be committed; if it is, the
+# guardrail's holdout-write block is effectively disabled for everyone.
+factory/.bootstrap_unlock
+
+# Python bytecode (the loop helpers use python3 inline).
+__pycache__/
+*.pyc
