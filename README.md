@@ -1,15 +1,32 @@
-# factory
+# local-factory
 
-A small, filesystem-driven build loop for LLM agents. Correctness is judged
-by **observable program behavior** against sealed *holdout* scenarios, not by
-reading source or running brittle tests. The builder agent never sees the
-holdout; a separate judge agent does, and scores the program's behavior on
-a 0.0–1.0 satisfaction scale. Failures feed back into an append-only memory
-log that informs the next iteration.
+A small, filesystem-driven build loop for LLM coding agents. Correctness is
+judged by **observable program behavior** against sealed *holdout* scenarios,
+not by reading source or running brittle tests. The builder agent never sees
+the holdout; a separate judge agent does, and scores the program's behavior
+on a 0.0–1.0 satisfaction scale. Failures feed back into an append-only
+memory log that informs the next iteration.
 
 The loop is intentionally local, intentionally Markdown-driven, and
 intentionally **never commits**. A human reviews the staged diff at the end
 of each task and decides whether to commit.
+
+## Status and scope
+
+Currently built on [Claude Code](https://docs.claude.com/claude-code)'s
+headless `claude -p` mode and its `PreToolUse` / `Stop` hooks. The
+scenario/holdout *pattern* is agent-agnostic, and the agent-CLI surface in
+`factory/loop.sh` is small (roughly 30 lines of `claude -p` invocations
+and JSON-envelope parsing), so a port to a different agent CLI is
+tractable — but no such port exists yet. If you arrived expecting a
+vendor-neutral tool: today this is Claude Code only.
+
+The seed task in `factory/tasks/greet.md` has been run end-to-end once and
+converged in a single iteration. The feedback loop — failures driving the
+next iteration through `memory/log.md` — has not yet been observed
+empirically, because the seed task was too easy. Consider the project
+*alpha*: the bones are real, the load-bearing parts are tested, the
+hard-task evidence is still ahead.
 
 ## Why
 
