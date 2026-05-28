@@ -211,6 +211,10 @@ one iteration with `min_satisfaction = 1.0`; see
 
 No third-party Python packages.
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Repository layout
 
 ```
