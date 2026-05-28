@@ -41,3 +41,9 @@ Append-only. Newest at the bottom. Each session leaves a dated marker.
   `permissions.deny` rules in settings.local.json would have made the
   bootstrap_unlock sentinel dead in future sessions. **Fix:** removed those
   denies; the hook is the only enforcement layer now.
+- greet iter: created `greet.py` at repo root — argparse with required `--name`, prints `Hello, <NAME>!` on stdout, errors to stderr on missing/empty name, stdlib-only, ~25 lines.
+
+## 2026-05-28
+
+
+- iter 1 CONVERGED: score=1.0 >= 0.9. Summary at factory/runs/summaries/greet.md. Awaiting human approval to commit.
