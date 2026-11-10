@@ -20,7 +20,9 @@ from local_factory.agents.backend import (
 )
 from local_factory.agents.fake import (
     DEFAULT_USAGE,
+    DESCRIPTION_CHARS,
     ERROR_TAIL_CHARS,
+    MAX_ERROR_CHARS,
     Action,
     DeleteFile,
     EmitOutput,
@@ -151,6 +153,15 @@ def test_relative_worker_directory_is_resolved(
     assert (tmp_path / "rel" / "a.txt").read_text() == "x"
 
 
+def test_looping_worker_directory_is_an_error(tmp_path: Path) -> None:
+    (tmp_path / "w1").symlink_to("w2")
+    (tmp_path / "w2").symlink_to("w1")
+    result = run_script(WorkerHandle(work_dir=tmp_path / "w1"), WriteFile("a.txt", "x"))
+    assert (
+        result.error == f"worker directory {tmp_path / 'w1'} does not exist or is not a directory"
+    )
+
+
 def test_symlinked_worker_directory_is_followed(tmp_path: Path) -> None:
     real = tmp_path / "real"
     real.mkdir()
@@ -243,14 +254,59 @@ def test_silent_failing_command_reports_status_only(worker: WorkerHandle) -> Non
     assert result.error.endswith("): exit status 5")
 
 
+# "action N (" + description + "): exit status N: " + output tail
+COMMAND_ERROR_BOUND = DESCRIPTION_CHARS + ERROR_TAIL_CHARS + 64
+
+
 def test_long_command_output_is_truncated_to_its_tail(worker: WorkerHandle) -> None:
     noisy = (
         f"import sys; sys.stderr.write('x' * {ERROR_TAIL_CHARS * 3} + 'END'); raise SystemExit(1)"
     )
     result = run_script(worker, py(noisy))
     assert result.error is not None
-    assert result.error.endswith("xEND")
-    assert len(result.error) < ERROR_TAIL_CHARS + 200
+    assert result.error.endswith("): exit status 1: " + "x" * (ERROR_TAIL_CHARS - 3) + "END")
+    assert len(result.error) <= COMMAND_ERROR_BOUND
+
+
+def test_huge_argv_is_elided_from_the_error(worker: WorkerHandle) -> None:
+    code = "import sys; sys.stderr.write('boom'); raise SystemExit(1)"
+    result = run_script(worker, RunCommand((PY, "-c", code, "a" * 50_000 + "LAST")))
+    assert result.error is not None
+    assert len(result.error) <= DESCRIPTION_CHARS + 64
+    description = result.error.removeprefix("action 1 (").split("): exit status")[0]
+    assert len(description) == DESCRIPTION_CHARS
+    assert description.startswith(f"RunCommand {PY[:20]}")
+    assert "..." in description
+    assert description.endswith("aLAST")
+    assert result.error.endswith("): exit status 1: boom")
+
+
+def test_huge_missing_binary_name_keeps_the_error_bounded(worker: WorkerHandle) -> None:
+    result = run_script(worker, RunCommand(("b" * 50_000,)))
+    assert result.status == "error"
+    assert result.error is not None
+    assert len(result.error) <= MAX_ERROR_CHARS
+
+
+def test_huge_path_keeps_the_error_bounded(worker: WorkerHandle) -> None:
+    result = run_script(worker, WriteFile("p" * 100_000, "x"))
+    assert result.status == "error"
+    assert result.error is not None
+    assert len(result.error) <= MAX_ERROR_CHARS
+
+
+def test_every_error_message_is_capped_keeping_head_and_tail(worker: WorkerHandle) -> None:
+    result = run_script(worker, Fail("HEAD" + "z" * 100_000 + "TAIL"))
+    assert result.error is not None
+    assert len(result.error) == MAX_ERROR_CHARS
+    assert result.error.startswith("HEADzzz")
+    assert result.error.endswith("zzzTAIL")
+    assert "z...z" in result.error
+
+
+def test_error_exactly_at_the_cap_is_kept_whole(worker: WorkerHandle) -> None:
+    message = "m" * MAX_ERROR_CHARS
+    assert run_script(worker, Fail(message)).error == message
 
 
 def test_missing_binary_is_an_error(worker: WorkerHandle) -> None:

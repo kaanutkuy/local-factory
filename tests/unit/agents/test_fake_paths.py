@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from local_factory.agents.backend import WorkerHandle
-from local_factory.agents.fake import DeleteFile, WriteFile
+from local_factory.agents.fake import SYMLINK_LOOP, DeleteFile, WriteFile
 
 from .conftest import run_script
 
@@ -137,10 +137,12 @@ def test_absolute_path_is_rejected_even_inside_the_worker(worker: WorkerHandle) 
 
 
 def test_nul_byte_in_path_is_an_error(worker: WorkerHandle) -> None:
-    result = run_script(worker, WriteFile("a\x00b", "x"))
-    assert result.status == "error"
-    assert result.error is not None
-    assert "ValueError" in result.error
+    for action in (WriteFile("a\x00b", "x"), DeleteFile("a\x00b")):
+        result = run_script(worker, action)
+        assert (
+            result.error
+            == f"action 1 ({type(action).__name__} 'a\\x00b'): path contains a NUL byte"
+        )
 
 
 def test_symlinked_parent_escaping_the_worker_is_rejected(
@@ -202,13 +204,19 @@ def test_symlink_to_the_worker_root_is_not_a_file(worker: WorkerHandle) -> None:
     assert (worker.work_dir / "self").is_symlink()
 
 
-def test_symlink_loop_is_an_error(worker: WorkerHandle) -> None:
+@pytest.mark.parametrize(
+    "action",
+    [WriteFile("a", "x"), WriteFile("a/f.txt", "x"), DeleteFile("a"), DeleteFile("b/f.txt")],
+)
+def test_symlink_loop_is_one_error_on_every_python_version(
+    worker: WorkerHandle, action: WriteFile | DeleteFile
+) -> None:
+    """Path.resolve() raises RuntimeError for loops on 3.12 but not on 3.13+; we report one way."""
     (worker.work_dir / "a").symlink_to("b")
     (worker.work_dir / "b").symlink_to("a")
-    result = run_script(worker, WriteFile("a", "x"))
-    assert result.status == "error"
-    assert result.error is not None
-    assert "symbolic links" in result.error
+    result = run_script(worker, action)
+    assert result.error == f"action 1 ({type(action).__name__} {action.path!r}): {SYMLINK_LOOP}"
+    assert tree(worker.work_dir) == ["a", "b"]
 
 
 # --------------------------------------------------------------------------- DeleteFile

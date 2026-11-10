@@ -7,11 +7,15 @@ spending tokens.
 
 Every scripted failure becomes an `AgentResult` with `status="error"`; `run` never raises for
 them. Only a malformed script (an item that is not an action) is rejected, at construction.
+Error messages are persisted in the ledger, so each is bounded (`MAX_ERROR_CHARS`) and worded the
+same on every supported Python version.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,7 +29,11 @@ from local_factory.agents.backend import AgentResult, AgentTask, Capability, Rol
 from local_factory.models import Halt, HaltReason, Usage
 
 DEFAULT_USAGE = Usage(input_tokens=100, output_tokens=50)
-ERROR_TAIL_CHARS = 2_000
+ERROR_TAIL_CHARS = 2_000  # command output kept in an error: the last N characters
+DESCRIPTION_CHARS = 160  # an action's description (path or argv) in an error
+MAX_ERROR_CHARS = 4_000  # hard cap on any error message
+SYMLINK_LOOP = "path goes through a symlink loop"
+_ELISION = "..."
 
 _JSON_OBJECT: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 
@@ -101,9 +109,11 @@ class FakeBackend:
         script = self._script_for(role, task)
         if script is None:
             return self._error(f"no script for task {task.task_id!r} or role {role.name!r}")
-        root = worker.work_dir.resolve()
+        root = Path(os.path.realpath(worker.work_dir))
         if not root.is_dir():
-            return self._error(f"worker directory {worker.work_dir} does not exist")
+            return self._error(
+                f"worker directory {worker.work_dir} does not exist or is not a directory"
+            )
         emitted: dict[str, JsonValue] | None = None
         for index, action in enumerate(script, start=1):
             if isinstance(action, EmitOutput):
@@ -146,7 +156,7 @@ class FakeBackend:
         return AgentResult(status="ok", structured_output=output, usage=self._usage)
 
     def _error(self, message: str) -> AgentResult:
-        return AgentResult(status="error", error=message, usage=self._usage)
+        return AgentResult(status="error", error=_clip(message, MAX_ERROR_CHARS), usage=self._usage)
 
 
 def _checked_script(key: str, actions: Sequence[Action]) -> tuple[Action, ...]:
@@ -168,7 +178,7 @@ async def _perform(action: _SideEffect, root: Path) -> str | None:
             await _run_command(root, action.argv)
     except _ActionError as exc:
         return str(exc)
-    except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError: symlink loops on 3.12
+    except (OSError, ValueError) as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
 
@@ -181,19 +191,37 @@ def _confine(root: Path, raw: str) -> tuple[Path, Path]:
     an entry, and paths whose parent or target resolve outside `root` (via `..` or symlinks) are
     rejected before anything is touched.
     """
+    if "\x00" in raw:
+        raise _ActionError("path contains a NUL byte")
     relative = Path(raw)
     if relative.is_absolute():
         raise _ActionError("absolute paths are not allowed; use a path relative to the worker")
     if relative.name in ("", ".."):
         raise _ActionError("path does not name a file")
-    parent = (root / relative).parent.resolve()
+    parent = _resolve((root / relative).parent)
     if not parent.is_relative_to(root):
         raise _ActionError("path escapes the worker directory")
     entry = parent / relative.name
-    target = entry.resolve()
+    target = _resolve(entry)
     if target == root or not target.is_relative_to(root):
         raise _ActionError("path escapes the worker directory")
     return entry, target
+
+
+def _resolve(path: Path) -> Path:
+    """Resolve every symlink in `path`, identically on all supported Python versions.
+
+    `Path.resolve()` raises `RuntimeError` on a symlink loop before 3.13 and quietly returns the
+    looping path from 3.13 on. `os.path.realpath` never raises for a loop, so loops are detected
+    here, explicitly, and reported with one message. A missing `path` is fine (it may be created).
+    """
+    resolved = Path(os.path.realpath(path))
+    try:
+        resolved.stat()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _ActionError(SYMLINK_LOOP) from exc
+    return resolved
 
 
 def _write_file(root: Path, raw: str, content: str) -> None:
@@ -228,5 +256,14 @@ async def _run_command(root: Path, argv: tuple[str, ...]) -> None:
 
 def _describe(action: _SideEffect) -> str:
     if isinstance(action, RunCommand):
-        return f"RunCommand {shlex.join(action.argv)}"
-    return f"{type(action).__name__} {action.path!r}"
+        return _clip(f"RunCommand {shlex.join(action.argv)}", DESCRIPTION_CHARS)
+    return _clip(f"{type(action).__name__} {action.path!r}", DESCRIPTION_CHARS)
+
+
+def _clip(text: str, limit: int) -> str:
+    """`text` if it fits in `limit` characters, else its head and tail around an elision mark."""
+    if len(text) <= limit:
+        return text
+    keep = limit - len(_ELISION)
+    head = keep // 2
+    return text[:head] + _ELISION + text[len(text) - (keep - head) :]
