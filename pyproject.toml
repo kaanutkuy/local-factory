@@ -1,0 +1,68 @@
+[project]
+name = "local-factory"
+version = "0.1.0"
+description = "A local software factory: contract-first intake, orchestrated and verified builds, evidence-bound releases."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.11"]
+
+[project.scripts]
+factory = "local_factory.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.4", "pytest-cov>=6.2", "ruff>=0.12", "mypy>=1.17"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_factory"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["tests/fixtures", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PT", "N", "C4", "S", "PTH", "RET", "ARG"]
+# S603/S607: the factory deliberately runs git and gate commands as subprocesses with list argv.
+ignore = ["S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108", "ARG001", "ARG002", "PT018"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["local_factory"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+exclude = ["^tests/fixtures/"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".*", "fixtures"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: uses real git repositories and subprocesses",
+    "live: spends real LLM tokens; opt-in only",
+]
+
+[tool.coverage.run]
+source = ["local_factory"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true

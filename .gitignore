@@ -1,10 +1,16 @@
-# Per-run state — recreated by each loop invocation.
-factory/runs/state.json
-
-# Holdout-write sentinel. Should never be committed; if it is, the
-# guardrail's holdout-write block is effectively disabled for everyone.
-factory/.bootstrap_unlock
-
-# Python bytecode (the loop helpers use python3 inline).
+# Python / tooling
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local factory state must never live in this repo
+.local-factory/

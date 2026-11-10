@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# The single verification entrypoint for this repo. CI runs exactly this.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== ruff check";        uv run ruff check .
+echo "== ruff format";       uv run ruff format --check .
+echo "== mypy (strict)";     uv run mypy
+echo "== pytest + coverage"; uv run pytest --cov --cov-report=term "$@"

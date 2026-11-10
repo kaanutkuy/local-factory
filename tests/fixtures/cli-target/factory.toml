@@ -1,0 +1,9 @@
+[project]
+name = "cli-target"
+
+[commands]
+lint = "python3 -m py_compile greet.py slugify.py"
+unit = "python3 -m unittest discover -s tests -q"
+
+[paths]
+protected = ["tests/acceptance/**", "factory.toml"]
