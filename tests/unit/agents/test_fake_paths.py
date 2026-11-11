@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from local_factory.agents.backend import WorkerHandle
-from local_factory.agents.fake import SYMLINK_LOOP, DeleteFile, WriteFile
+from local_factory.agents.fake import DeleteFile, WriteFile
+from local_factory.agents.local import SYMLINK_LOOP
 
 from .conftest import run_script
 

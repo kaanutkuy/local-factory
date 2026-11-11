@@ -30,7 +30,7 @@ from local_factory.models import (
     Usage,
 )
 from local_factory.pipeline import SliceOutcome
-from local_factory.pipeline.host_slice import UNREPORTED
+from local_factory.pipeline.flow import UNREPORTED
 
 from .conftest import (
     IMPLEMENT_SHOUT,

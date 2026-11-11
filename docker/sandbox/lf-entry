@@ -1,0 +1,9 @@
+#!/usr/local/bin/python3 -I
+# The factory's entrypoint inside the box. -I (isolated mode): neither the working directory
+# (often the worker-controlled /work) nor PYTHON* variables can put code on sys.path.
+import sys
+
+sys.path.insert(0, "/opt/local-factory")
+from local_factory.sandbox.entry import main  # noqa: E402
+
+raise SystemExit(main(sys.argv[1:]))

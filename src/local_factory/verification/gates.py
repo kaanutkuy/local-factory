@@ -36,7 +36,7 @@ _CHUNK_BYTES = 65_536
 # After the gate's process group is gone, how long to wait for its output pipe to close. It only
 # stays open if a process escaped the group (e.g. via setsid) while holding the gate's stdout.
 _DRAIN_GRACE_S = 2.0
-_NOTE_PREFIX = "[local-factory] "
+NOTE_PREFIX = "[local-factory] "  # starts every line the factory adds to a gate's output
 _HOME_PREFIX = "local-factory-gate-"
 GATE_LANG = "C.UTF-8"
 
@@ -103,7 +103,7 @@ def run_gate(
     # ignore_cleanup_errors: a process that escaped the group may still be writing into HOME;
     # TemporaryDirectory already resets permissions to delete read-only trees.
     with tempfile.TemporaryDirectory(prefix=_HOME_PREFIX, ignore_cleanup_errors=True) as home:
-        return _run(spec, cwd=cwd, env=gate_env(home, env), tail=_Tail(tail_bytes))
+        return _run(spec, cwd=cwd, env=gate_env(home, env), tail=OutputTail(tail_bytes))
 
 
 def gate_env(home: str, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -117,7 +117,7 @@ def gate_env(home: str, overrides: Mapping[str, str] | None = None) -> dict[str,
     return {**base, **(overrides or {})}
 
 
-def _run(spec: GateSpec, *, cwd: Path, env: dict[str, str], tail: _Tail) -> GateResult:
+def _run(spec: GateSpec, *, cwd: Path, env: dict[str, str], tail: OutputTail) -> GateResult:
     started = time.monotonic()
     try:
         # Executing a configured shell command line is the gate runner's whole purpose (CLAUDE.md:
@@ -192,16 +192,7 @@ def run_gates(
     stopper: GateResult | None = None
     for spec in specs:
         if stopper is not None:
-            results.append(
-                GateResult(
-                    name=spec.name,
-                    status=GateStatus.SKIPPED,
-                    output_tail=(
-                        f"{_NOTE_PREFIX}not run: gate {stopper.name!r} finished with status "
-                        f"{stopper.status.value!r} and fail_fast is set"
-                    ),
-                )
-            )
+            results.append(skipped_result(spec, stopper))
             continue
         result = run_gate(spec, cwd=cwd, env=env)
         results.append(result)
@@ -210,11 +201,27 @@ def run_gates(
     return results
 
 
-# --------------------------------------------------------------------------- internals
+def skipped_result(spec: GateSpec, stopper: GateResult) -> GateResult:
+    """The SKIPPED result for ``spec``, not run because ``stopper`` ended a fail_fast run.
+
+    Shared with the box's gate runner (``local_factory.sandbox``), so both say exactly the same.
+    """
+    return GateResult(
+        name=spec.name,
+        status=GateStatus.SKIPPED,
+        output_tail=(
+            f"{NOTE_PREFIX}not run: gate {stopper.name!r} finished with status "
+            f"{stopper.status.value!r} and fail_fast is set"
+        ),
+    )
 
 
-class _Tail:
-    """A thread-safe byte sink that keeps only the last ``limit`` bytes written to it."""
+class OutputTail:
+    """A thread-safe byte sink that keeps only the last ``limit`` bytes written to it.
+
+    :meth:`text` never has more than ``limit`` characters: a UTF-8 character that the truncation
+    cut in half is dropped, and any other invalid byte becomes one replacement character.
+    """
 
     def __init__(self, limit: int) -> None:
         self._limit = limit
@@ -232,7 +239,7 @@ class _Tail:
 
     def note(self, message: str) -> None:
         """Append a factory note on its own line (subject to the same bound as the output)."""
-        self.feed(f"\n{_NOTE_PREFIX}{message}\n".encode())
+        self.feed(f"\n{NOTE_PREFIX}{message}\n".encode())
 
     def text(self) -> str:
         with self._lock:
@@ -240,6 +247,9 @@ class _Tail:
         if truncated:
             data = _drop_partial_utf8_char(data)
         return data.decode("utf-8", errors="replace")
+
+
+# --------------------------------------------------------------------------- internals
 
 
 def _drop_partial_utf8_char(data: bytes) -> bytes:
@@ -250,7 +260,7 @@ def _drop_partial_utf8_char(data: bytes) -> bytes:
     return data[skip:]
 
 
-def _drain(stream: IO[bytes], tail: _Tail) -> None:
+def _drain(stream: IO[bytes], tail: OutputTail) -> None:
     with stream:
         while chunk := stream.read(_CHUNK_BYTES):
             tail.feed(chunk)

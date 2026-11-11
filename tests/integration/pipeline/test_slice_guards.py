@@ -16,7 +16,8 @@ from .conftest import IMPLEMENT_SHOUT, VERIFIER_PASS, World
 
 pytestmark = pytest.mark.integration
 
-SLICE = "local_factory.pipeline.host_slice"
+FLOW = "local_factory.pipeline.flow"
+HOST = "local_factory.pipeline.host_slice"
 
 
 def _backend() -> FakeBackend:
@@ -38,7 +39,7 @@ def test_unbound_evidence_is_a_factory_bug(world: World, monkeypatch: pytest.Mon
         evidence = build_evidence(**kwargs)
         return evidence.model_copy(update={"oracle_version": "sha256:" + "c" * 64})
 
-    monkeypatch.setattr(f"{SLICE}.build_evidence", stale_oracle)
+    monkeypatch.setattr(f"{FLOW}.build_evidence", stale_oracle)
     with pytest.raises(SliceError, match="oracle version mismatch"):
         world.run(_backend())
     assert world.ledger.get_ticket(world.ticket_id).status is TicketStatus.CONVERGED
@@ -51,7 +52,7 @@ def test_an_export_failure_after_the_commit_check_propagates(
     def broken_export(*args: Any, **kwargs: Any) -> None:
         raise GitError(("bundle", "create"), 128, "fatal: disk full")
 
-    monkeypatch.setattr(f"{SLICE}.export_task_bundle", broken_export)
+    monkeypatch.setattr(f"{HOST}.export_task_bundle", broken_export)
     with pytest.raises(GitError, match="disk full"):
         world.run(_backend())
     assert world.ledger.get_task("T-0001/task-1").status is TaskStatus.RUNNING

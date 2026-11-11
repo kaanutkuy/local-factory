@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from local_factory.agents.backend import (
     WorkerHandle,
 )
 from local_factory.agents.fake import (
+    DEFAULT_COMMAND_TIMEOUT_S,
     DEFAULT_USAGE,
     DESCRIPTION_CHARS,
     ERROR_TAIL_CHARS,
@@ -232,17 +234,19 @@ def test_command_output_is_captured_not_leaked(
     assert (captured.out, captured.err) == ("", "")
 
 
-def test_failing_command_reports_status_and_stderr_tail(worker: WorkerHandle) -> None:
-    result = run_script(
-        worker, py("import sys; print('noise'); sys.stderr.write('boom\\n'); raise SystemExit(3)")
+def test_failing_command_reports_status_and_interleaved_output_tail(worker: WorkerHandle) -> None:
+    code = (
+        "import sys; print('out', flush=True); sys.stderr.write('err\\n'); sys.stderr.flush(); "
+        "print('last', flush=True); raise SystemExit(3)"
     )
+    result = run_script(worker, py(code))
     assert result.status == "error"
     assert result.error is not None
     assert result.error.startswith("action 1 (RunCommand ")
-    assert result.error.endswith("): exit status 3: boom")
+    assert result.error.endswith("): exit status 3: out\nerr\nlast")
 
 
-def test_failing_command_falls_back_to_stdout(worker: WorkerHandle) -> None:
+def test_failing_command_with_stdout_only(worker: WorkerHandle) -> None:
     result = run_script(worker, py("print('only stdout'); raise SystemExit(2)"))
     assert result.error is not None
     assert result.error.endswith("exit status 2: only stdout")
@@ -333,6 +337,37 @@ def test_non_executable_command_is_an_error(worker: WorkerHandle) -> None:
 def test_empty_argv_is_an_error(worker: WorkerHandle) -> None:
     result = run_script(worker, RunCommand(()))
     assert result.error == "action 1 (RunCommand ): empty argv"
+
+
+def test_command_killed_at_its_own_timeout(worker: WorkerHandle) -> None:
+    result = run_script(
+        worker,
+        RunCommand(("sh", "-c", "echo started; exec sleep 30"), timeout_s=1.0),
+        WriteFile("after.txt", "x"),
+    )
+    assert result.error == (
+        "action 1 (RunCommand sh -c 'echo started; exec sleep 30'): "
+        "timed out after 1s and was killed: started"
+    )
+    assert not (worker.work_dir / "after.txt").exists()
+
+
+def test_command_killed_at_the_backend_default_timeout(worker: WorkerHandle) -> None:
+    backend = FakeBackend({"implementer": [RunCommand(("sleep", "30"))]}, command_timeout_s=0.25)
+    result = run(backend, worker)
+    assert result.error == "action 1 (RunCommand sleep 30): timed out after 0.25s and was killed"
+
+
+def test_default_command_timeout() -> None:
+    assert DEFAULT_COMMAND_TIMEOUT_S == 300.0
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, math.nan, math.inf])
+def test_timeouts_must_be_positive_and_finite(bad: float) -> None:
+    with pytest.raises(ValueError, match=r"RunCommand\.timeout_s"):
+        RunCommand(("true",), timeout_s=bad)
+    with pytest.raises(ValueError, match="command_timeout_s"):
+        FakeBackend({}, command_timeout_s=bad)
 
 
 def test_concurrent_runs_do_not_interfere(tmp_path: Path) -> None:

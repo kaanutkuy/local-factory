@@ -97,8 +97,9 @@ def test_a_candidate_conflict_with_a_moved_main_returns_to_building(world: World
     assert (outcome.verdict.round, outcome.verdict.passed) == (1, True)
     assert (outcome.candidate_sha, outcome.evidence) == (None, None)
     assert world.transitions()[-3:] == [T.VERIFYING, T.CONVERGED, T.BUILDING]
-    reason = world.ledger.events(world.ticket_id)[-1].data["reason"]
-    assert reason == "candidate_conflict: greet.py"
+    back = world.ledger.events(world.ticket_id)[-1]
+    assert (back.kind, back.to_status) == ("transition", T.BUILDING)
+    assert back.data == {"reason": "candidate_conflict", "detail": {"conflicts": ["greet.py"]}}
     assert world.task_ends() == {}  # the task merged cleanly; the ticket branch conflicts
     assert world.repo.rev_parse("refs/heads/main") == moved
     world.assert_boundaries()

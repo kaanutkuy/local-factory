@@ -11,16 +11,18 @@ import pytest
 
 from local_factory.gitops._git import FACTORY_EMAIL, FACTORY_NAME, GitError, run_git
 from local_factory.gitops.bare import BareRepo
-from local_factory.gitops.bundles import export_base_bundle
+from local_factory.gitops.bundles import export_base_bundle, import_task_bundle
 from local_factory.gitops.worker_side import (
     TASK_BRANCH,
+    check_sha,
     commit_all,
     export_task_bundle,
+    export_task_bundle_to_stdout,
     has_task_commits,
     init_from_bundle,
 )
 
-from .conftest import Git, make_work, write
+from .conftest import DEST, Git, make_work, write
 
 pytestmark = pytest.mark.integration
 
@@ -174,3 +176,66 @@ def test_has_task_commits_raises_on_broken_repos(work: Path, base: str, git: Git
     shutil.rmtree(work / ".git")
     with pytest.raises(GitError):  # no repository at all
         has_task_commits(work, base_sha=base)
+
+
+# --------------------------------------------------------------------------- streamed export
+
+
+def test_streamed_bundle_matches_the_file_export(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    head = commit_all(work, "x")
+    streamed = tmp_path / "streamed.bundle"
+    with streamed.open("wb") as fh:
+        export_task_bundle_to_stdout(work, base_sha=base, fd=fh.fileno())
+    assert git("bundle", "list-heads", str(streamed), cwd=tmp_path) == f"{head} refs/heads/task"
+    imported = import_task_bundle(repo, streamed, base_sha=base, dest_ref=DEST)
+    assert imported.head_sha == head
+    assert [c.path for c in imported.changes] == ["x.txt"]
+
+
+def test_streamed_export_writes_to_stdout_by_default(
+    base: str, work: Path, capfdbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    commit_all(work, "x")
+    export_task_bundle_to_stdout(work, base_sha=base)
+    captured = capfdbinary.readouterr()
+    assert captured.out.startswith(b"# v2 git bundle\n")
+    assert captured.err == b""
+
+
+def test_streamed_export_ignores_the_callers_git_environment(
+    base: str, work: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    commit_all(work, "x")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere.git"))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.bare'='true'")
+    out = tmp_path / "task.bundle"
+    with out.open("wb") as fh:
+        export_task_bundle_to_stdout(work, base_sha=base, fd=fh.fileno())
+    assert out.stat().st_size > 0
+
+
+def test_streamed_export_failures(base: str, work: Path, tmp_path: Path) -> None:
+    out = tmp_path / "task.bundle"
+    with out.open("wb") as fh:
+        with pytest.raises(GitError, match="empty bundle"):
+            export_task_bundle_to_stdout(work, base_sha=base, fd=fh.fileno())
+        with pytest.raises(ValueError, match="full object name"):
+            export_task_bundle_to_stdout(work, base_sha="HEAD", fd=fh.fileno())
+        shutil.rmtree(work / ".git")
+        with pytest.raises(GitError) as broken:
+            export_task_bundle_to_stdout(work, base_sha=base, fd=fh.fileno())
+    assert broken.value.args[:3] == ("bundle", "create", "--quiet")
+    assert broken.value.returncode != 0
+
+
+def test_check_sha() -> None:
+    check_sha("a" * 40)
+    check_sha("b" * 64)
+    for bad in ("a" * 39, "A" * 40, "a" * 41, "HEAD", ""):
+        with pytest.raises(ValueError, match="full object name"):
+            check_sha(bad)

@@ -1,6 +1,6 @@
 """Factory-level and project-level configuration. Orchestrator-owned.
 
-- Factory config: ``$LOCAL_FACTORY_HOME/config.toml`` (tiers -> models, pricing). Optional.
+- Factory config: ``$LOCAL_FACTORY_HOME/config.toml`` (tiers -> models, pricing, sandbox). Optional.
 - Project config: ``factory.toml`` at the root of a target repo (commands, protected paths,
   policy thresholds, release policy). Required for every target; itself always protected.
 """
@@ -8,13 +8,14 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import tomllib
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from local_factory.models import FrozenModel, RiskTier, Tier
 
@@ -76,7 +77,112 @@ class ProjectConfig(FrozenModel):
 _PROJECT_SECTIONS = frozenset({"project", "commands", "paths", "policy", "release"})
 _PROJECT_KEYS = frozenset({"name"})
 _PATHS_KEYS = frozenset({"protected"})
-_FACTORY_KEYS = frozenset({"tiers", "pricing", "apex_enabled"})
+_FACTORY_KEYS = frozenset({"tiers", "pricing", "apex_enabled", "sandbox"})
+_SANDBOX_KEYS = frozenset(
+    {
+        "image",
+        "docker",
+        "uid",
+        "gid",
+        "memory_mb",
+        "cpus",
+        "pids_limit",
+        "work_size_mb",
+        "tmp_size_mb",
+        "command_timeout_s",
+        "run_timeout_s",
+        "max_bundle_bytes",
+        "max_output_bytes",
+        "cache_mounts",
+        "gate_env",
+    }
+)
+
+
+# --------------------------------------------------------------------------- sandbox config
+
+DEFAULT_SANDBOX_IMAGE = "local-factory/sandbox:v1"
+SANDBOX_UID = 10001  # the box's user: never root, never the host user (checked at runtime)
+# Paths inside the box that the factory itself uses; a cache mount may not shadow them.
+RESERVED_BOX_PATHS: tuple[str, ...] = (
+    "/work",
+    "/in",
+    "/opt/local-factory",
+    "/tmp",  # noqa: S108 - a path inside the container, not a host temp file
+    "/home",
+)
+
+
+def _box_path(value: str, what: str) -> str:
+    if not value.startswith("/") or posixpath.normpath(value) != value or value == "/":
+        raise ValueError(f"{what} must be a normalized absolute path other than '/': {value!r}")
+    if "," in value or "=" in value:
+        raise ValueError(f"{what} must not contain ',' or '=': {value!r}")
+    return value
+
+
+class CacheMount(FrozenModel):
+    """A host directory mounted read-only into gate containers (e.g. a warm uv cache)."""
+
+    source: Path
+    target: str
+
+    @field_validator("source")
+    @classmethod
+    def _absolute_source(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError(f"cache mount source must be absolute: {value}")
+        if "," in str(value) or "=" in str(value):
+            raise ValueError(f"cache mount source must not contain ',' or '=': {value}")
+        return value
+
+    @field_validator("target")
+    @classmethod
+    def _box_target(cls, value: str) -> str:
+        _box_path(value, "cache mount target")
+        for reserved in RESERVED_BOX_PATHS:
+            if value == reserved or value.startswith(reserved + "/"):
+                raise ValueError(f"cache mount target {value!r} shadows the reserved {reserved}")
+        return value
+
+
+class SandboxConfig(FrozenModel):
+    """The box every worker action, gate and export runs in (docs/specs/phase-1b.md).
+
+    There is no setting that grants network access, root, capabilities or host mounts: those
+    are fixed by the runtime, not configurable.
+    """
+
+    image: str = Field(default=DEFAULT_SANDBOX_IMAGE, min_length=1)
+    docker: str = Field(default="docker", min_length=1)  # the docker CLI to run
+    uid: int = Field(default=SANDBOX_UID, ge=1)
+    gid: int = Field(default=SANDBOX_UID, ge=1)
+    memory_mb: int = Field(default=2048, ge=64)
+    cpus: float = Field(default=2.0, gt=0.0)
+    pids_limit: int = Field(default=512, ge=16)
+    work_size_mb: int = Field(default=1024, ge=16)  # the task workspace (tmpfs) quota
+    tmp_size_mb: int = Field(default=256, ge=16)  # /tmp and $HOME inside the box, each
+    command_timeout_s: float = Field(default=300.0, gt=0.0)  # one command (RunCommand, a tool)
+    run_timeout_s: float = Field(default=3600.0, gt=0.0)  # one agent run, wall clock
+    max_bundle_bytes: int = Field(default=100_000_000, ge=1)  # exported task bundle cap
+    max_output_bytes: int = Field(default=1_000_000, ge=1024)  # kept per command or file read
+    cache_mounts: tuple[CacheMount, ...] = ()
+    gate_env: dict[str, str] = Field(default_factory=dict)  # extra env for gate commands
+
+    @field_validator("gate_env")
+    @classmethod
+    def _plain_env(cls, value: dict[str, str]) -> dict[str, str]:
+        for key, item in value.items():
+            if not key.isidentifier() or "\x00" in item:
+                raise ValueError(f"gate_env: invalid variable {key!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _distinct_cache_targets(self) -> Self:
+        targets = [m.target for m in self.cache_mounts]
+        if len(targets) != len(set(targets)):
+            raise ValueError(f"duplicate cache mount targets: {sorted(targets)}")
+        return self
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -190,6 +296,7 @@ class FactoryConfig(FrozenModel):
     tiers: dict[str, dict[Tier, str]] = Field(default_factory=lambda: _default_tiers())
     pricing: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_PRICING))
     apex_enabled: bool = False
+    sandbox: SandboxConfig = SandboxConfig()
 
     def model_for(self, backend: str, tier: Tier) -> str:
         if tier is Tier.APEX and not self.apex_enabled:
@@ -226,6 +333,7 @@ def load_factory_config(home: Path | None = None) -> FactoryConfig:
                 "tiers": _merge_tiers(_table(raw, "tiers", str(path)), str(path)),
                 "pricing": {**DEFAULT_PRICING, **_table(raw, "pricing", str(path))},
                 "apex_enabled": raw.get("apex_enabled", False),
+                "sandbox": _table(raw, "sandbox", str(path), _SANDBOX_KEYS),
             }
         )
     except ValidationError as exc:

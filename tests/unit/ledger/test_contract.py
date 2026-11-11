@@ -128,6 +128,7 @@ def test_freeze_appends_frozen_then_transition_at_one_timestamp(
         S.CONTRACT_PROPOSED,
         S.APPROVED,
     )
+    assert transition.data == {"reason": "contract frozen"}  # no structured detail
     assert frozen_event.at == transition.at == clock.now
     assert frozen_event.actor == transition.actor == "human"
     assert transition.seq == frozen_event.seq + 1

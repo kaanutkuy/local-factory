@@ -1,6 +1,7 @@
 # local-factory v1 — design and implementation plan
 
-Status: **proposal v1.1**, 2026-11-10. Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
+Status: **proposal v1.2**, 2026-11-11 (v1.2: the Phase 1b box has no network; agent placement
+is decided in Phase 2, see §5.3). Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
 Decisions recorded here came from an interview with the project owner plus one external design
 review; open decisions are listed in §15.
 
@@ -16,9 +17,11 @@ review; open decisions are listed in §15.
   Architect, are read-only to implementers, and include a sealed, black-box holdout.
 - **The orchestrator is code + an LLM advisor, not an LLM in a loop.** A deterministic state machine
   owns state, budgets, escalation, stop conditions and release decisions.
-- **The sandbox is the security boundary.** Workers run in hardened containers with standalone git
-  clones, no credentials worth stealing, and egress only through a factory-owned proxy and model
-  broker. Hooks and prompts are defense-in-depth.
+- **The sandbox is the security boundary.** Every worker action runs in a hardened container with
+  **no network**, as a user that is neither root nor the host user, on a standalone git clone, with
+  no credentials. How a model-driven agent reaches its model (a host-side loop acting through the
+  box, or an in-box agent behind a broker) is decided in Phase 2 (§5.3). Hooks and prompts are
+  defense-in-depth.
 - **Evidence is bound to an exact commit.** No stale verification result can authorize new code.
 - **Autonomy is earned.** R0/R1 changes ship dark after contract approval; R2 (auth, payments, data,
   migrations) holds for approval until a measured track record promotes it.
@@ -221,16 +224,42 @@ mounting the shared metadata exposes every ref, object, hook and config.
 
 ### 5.2 Container hardening
 
-Non-root uid · `--cap-drop=ALL` · `--security-opt=no-new-privileges` · `--read-only` rootfs with tmpfs
-`/tmp` and `$HOME` · writable mounts only `/work` and `/out` · no Docker socket · no host home ·
-pids/CPU/memory limits · attached only to an internal network with no default route.
+Non-root uid that is not the host user · `--cap-drop=ALL` · `--security-opt=no-new-privileges` ·
+`--read-only` rootfs with tmpfs `/tmp` and `$HOME` · the only writable mount is the task workspace
+`/work` (a size-limited tmpfs volume) · inputs mounted read-only · no Docker socket · no host home ·
+pids/CPU/memory limits and per-command / per-run wall-clock limits · **`--network none`** · the docker
+CLI itself runs with a minimal environment, so no host variable can reach a container. Outputs leave
+only as bounded data (a capped bundle stream, bounded text). Spec: `docs/specs/phase-1b.md`.
 
-### 5.3 Network and model broker
+Measured on this machine (Docker 29, 2026-11-11), for whenever a network is attached (option B):
+a plain `--internal` network still reaches host services bound to 0.0.0.0 via its gateway IP; with
+`com.docker.network.bridge.inhibit_ipv4=true` the host is unreachable, containers get no IPv6, peer
+DNS still works and external DNS is not forwarded.
+
+### 5.3 Network and model access
+
+**Phase 1b: the box has no network at all.** Whatever runs in it can edit and run code, nothing
+else: no installs, no connections. Dependencies come pre-baked in the image or as read-only caches;
+adding one is a human-approved image change, never something an agent can do from the box.
+
+**Agent placement is decided in Phase 2** (§15), while building the Claude backend:
+
+- **A — brain on the host, hands in the box.** The model loop runs in the factory process (the only
+  place the provider key exists); every tool call (write/read/delete a file, run a command) goes
+  through `ToolExecutor` into the box. No broker, no egress path. Costs: the backend's built-in tools
+  must all be disabled so nothing acts as the host user (enforce with a startup check + red-team
+  test), and the agent gets factory-provided tools instead of native ones. Budget is metered from
+  API responses the box never touches.
+- **B — the whole agent in the box**, reaching the model through a broker over an internal network
+  (below). Native tools, at the cost of the network/broker machinery.
+
+The decisive questions: can the SDK be reliably restricted to factory tools (A), and how much does
+agent quality suffer with simpler tools. Option B's design, kept for that decision:
 
 - **Egress proxy** (factory-owned) is the container's only route out. Allowlist: the model broker,
   package registries (ideally through a caching proxy). Everything else is denied and logged.
 - **Model broker** (host): the backend points at it (Claude: `ANTHROPIC_BASE_URL`, i.e. the LLM-gateway
-  mode — verify against current docs in Phase 1b). Each run gets a random token valid only for that
+  mode — verify against current docs in Phase 2). Each run gets a random token valid only for that
   run, its allowed models and its remaining budget. The broker injects the real provider key,
   meters usage from responses, and cuts the run off when the budget is spent. **Broker metering is
   the authoritative budget**; the SDK's `max_budget_usd` is an estimate and is only a secondary guard.
@@ -258,7 +287,10 @@ frame tool output as data.
 
 ### 5.6 Red-team suite (Phase 1, then every release of the factory)
 
-Scripted attacks, run from inside a worker container via `FakeBackend`. Each must fail:
+Scripted attacks, run from inside the box via `FakeBackend`. Each must fail. v1 (Phase 1b,
+`tests/redteam/`) covers the box: identity, visibility of host files/env/state/other workspaces,
+network, resource limits and the git escapes. The credential and egress items only apply to option B
+(§5.3) and land with it; the holdout redaction item lands with the probe containers in Phase 3.
 
 - read host files, host env vars, the host home directory
 - read or write another worker's volume
@@ -488,8 +520,8 @@ class AgentResult:
 
 | Backend | When | Notes |
 |---|---|---|
-| `FakeBackend` | Phase 1 | Scripted tool actions executed inside the worker container; drives the vertical slice and the red-team suite without LLM spend. |
-| `ClaudeAgentSDKBackend` | Phase 2 | `output_format`, `effort`, hooks, `agents`, `setting_sources=[]`, `RateLimitEvent`, routed through the broker. |
+| `FakeBackend` | Phase 1 | Scripted actions executed in the box through `ToolExecutor`; drives the vertical slice and the red-team suite without LLM spend. |
+| `ClaudeAgentSDKBackend` | Phase 2 | `output_format`, `effort`, hooks, `agents`, `setting_sources=[]`, `RateLimitEvent`. Placement per §5.3: A (host loop, tools through `ToolExecutor`) or B (in the box, through the broker). |
 | `OpenAICompatibleBackend` | Phase 7 | Llama/Qwen via Ollama or vLLM, behind the same broker; the factory supplies the tool loop itself. |
 | `CodexBackend` / OpenAI Agents | Phase 7+ | Enables cross-family verification. |
 
@@ -602,8 +634,8 @@ policy it imposes.
 |---|---|---|
 | **0. Reset** | Tag `legacy-v0`; remove `factory/`, `greet.py`, `slugify.py` (greet/slugify → `tests/fixtures/`); uv skeleton; ruff + mypy + pytest; CI for this repo; README rewrite. | `uv run factory --help`; CI green |
 | **1a. Control plane** | models, ledger + state machine, config, `AgentBackend` + `FakeBackend`, bare repo + bundle export/import + validation, gate runner, diff policy, min-aggregation, evidence binding. | unit + integration tests green, including negative bundle tests |
-| **1b. Boundary — vertical slice** | hardened worker container, internal network + egress proxy, broker (stub upstream), app/probe containers, red-team suite v1. | **one ticket, one worker, one isolated container, one commit, bundle import, one deterministic verification, one integration, evidence bound to the SHA**, all with FakeBackend and $0 LLM spend; red-team suite: every attack denied |
-| **2. Claude + Gate 1** | `ClaudeAgentSDKBackend` through the broker (real upstream); intake roles; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests |
+| **1b. Boundary — vertical slice** | the box: hardened, network-less containers for every worker action (`ToolExecutor`), worker git and export, gates (one fresh tree per gate); tmpfs task workspaces; the sandboxed slice; red-team suite v1. Spec: `docs/specs/phase-1b.md`. | **one ticket, one worker, one isolated container boundary, one commit, bundle import, one deterministic verification, one integration, evidence bound to the SHA (incl. the image digest)**, all with FakeBackend and $0 LLM spend; red-team suite v1: every check holds |
+| **2. Claude + Gate 1** | **agent placement decision (§5.3)**; `ClaudeAgentSDKBackend` (A: host loop + box tools; B: in the box + broker/proxy); intake roles; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests |
 | **3. Gate 2, single lane** *(highest priority)* | orchestrator, sequential implementer tasks, `verify_fast` + Stop gate, verify-ticket, redaction + leak scan, burn/rotate, escalation + stop rules, quality reviewer. | on a fixed benchmark of ≥5 notes-app tickets: converge rate recorded, ≥1 ticket needs >1 round and converges, zero holdout literals in any feedback, red-team still green. This proves **convergence**, not just execution. |
 | **4. Verification depth** | diff-scoped mutation, changed-line coverage, waivers, flake/session/data measures, blind per-AC behavioral check, Hypothesis, security reviewer. Metrics introduced one at a time with baselines. | a planted vacuous test and a planted wrong-expectation test are both caught; waiver flow audited end to end |
 | **5. Gate 3** | candidate squash + verify-ticket@SHA, commit statuses + branch protection, sha-pinned merge + tree-hash check, release policy (R2 hold, always-hold), migration linter + compatibility check + backup, canary + monitoring + auto-rollback, `factory pause`. **Needs the deploy-target decision.** | R1 ticket: prompt → prod with no human action after approval; R2 ticket holds; moving `main` during release forces re-verification (a stale pass is rejected); destructive migration is held; a broken deploy rolls back automatically |
@@ -614,8 +646,12 @@ policy it imposes.
 **Status (2026-11-11):** Phases 0 and 1a are complete. 1a also delivered the *host* vertical slice
 (`pipeline/host_slice.py`, spec `docs/specs/phase-1a-slice.md`): one ticket through FakeBackend,
 bundle import, diff policy, integration, verification, squash candidate and signed evidence bound to
-the candidate SHA, with worker git and gates still on the host. Phase 1b moves that same slice
-behind the container boundary without changing its interface.
+the candidate SHA, with worker git and gates still on the host. Phase 1b is complete too (spec
+`docs/specs/phase-1b.md`): the same slice runs behind the box (`pipeline/sandboxed_slice.py`), with
+every worker action, the worker's git, the export and every gate in network-less containers, the
+evidence bound to the sandbox image digest, and red-team suite v1 green; 2081 tests, 100% branch
+coverage on Python 3.12 and 3.14. App/probe containers moved to Phase 3 and the broker/proxy to
+option B (§5.3). **Next: Phase 2**, starting with the agent-placement decision (§15).
 
 ### 14.1 Carried forward from the Phase 1a review
 
@@ -628,11 +664,13 @@ cover them.
 |---|---|---|
 | 1b | Worker-side git (`gitops/worker_side.py`) and gate commands run on the host | Run them inside the hardened worker / gate containers; the host only sees bundles and reports (invariant 7) |
 | 1b | A worker can still crash the pipeline: an export failure after `has_task_commits` succeeded (e.g. corrupted objects) propagates | Export runs in a disposable container; any failure there → task `REJECTED`, reason `worker_git_error` |
-| 1b | Bundle size is not capped at import | `/out` quota in the sandbox plus a `BundleLimits.max_bundle_bytes` check before copying |
+| 1b | Bundle size is not capped at import | Export streams the bundle out of the box under a hard cap (`max_bundle_bytes`); import checks `BundleLimits.max_bundle_bytes` before copying |
 | 1b | `RunCommand` (FakeBackend) and agent commands have no timeout | Per-command and per-run wall-clock limits enforced by the container runtime |
 | 1b | Fresh per-gate `HOME` means cold tool caches (uv, pip, npm) | Mount read-only shared caches into gate containers explicitly |
-| 1b | Host code could follow a worker-produced symlink | Nothing on the host follows a worker-produced symlink; trees are exported with links as data |
+| 1b | Host code could follow a worker-produced symlink | Worker trees never land on the host: the box exports bundles, and gates and the verifier materialize trees inside the box |
 | 1b | Candidate-conflict paths are recorded only as transition text | Add structured `data` to `Ledger.transition` (as `update_task` already has) |
+| 2 | How a model-driven agent reaches its model (A: host loop + box tools; B: in-box agent + broker + egress proxy) | Decide while building `ClaudeAgentSDKBackend` (§5.3); B brings the broker, proxy and their red-team items |
+| 3 | Black-box holdout probes need app + probe containers (§5.4), and the redaction red-team item | Build them with the holdout store and verify-ticket |
 | 2 | Unsafe symlinks already in a target's base fail every task closed (`symlink_escape`) | `factory project add` detects and reports them when a repo is adopted |
 | 2 | `DiffPolicy.test_globs` are Python-only and not configurable | `[paths] test_globs` in `factory.toml` (needed for the notes-app JS/TS code) |
 | 4 | Gate-config edits that *remove* lines are invisible to the diff policy (it sees added lines only) | The factory runs coverage and mutation with its own config and `factory.toml [policy]` thresholds, so target-side config cannot weaken a gate |
@@ -644,7 +682,8 @@ cover them.
 
 | Decision | Needed before | Recommendation |
 |---|---|---|
-| Billing mode (API key vs Claude subscription) | Phase 1b (broker design) | **Decided (2026-11-10): API key → full broker.** (Subscription would have meant a short-lived in-container token + provider-only egress, documented as an accepted risk.) |
+| Billing mode (API key vs Claude subscription) | Phase 1b (broker design) | **Decided (2026-11-10): API key.** A broker is only needed under agent placement B. (Subscription would have meant a short-lived in-container token + provider-only egress, documented as an accepted risk.) |
+| Agent placement (§5.3) | Phase 2 | **Open (2026-11-11).** A = model loop on the host, tools through `ToolExecutor` into a network-less box (no broker); B = agent in the box behind a broker + egress proxy. Decide on evidence from the Claude backend: can it be reliably limited to factory tools, and what do simpler tools cost in quality. 1b builds what both need. |
 | Deploy target for the notes app | Phase 5 | Docker on Fly.io (releases make rollback simple; canary by machine); alternative: a VPS with docker compose + Caddy. |
 | R2 promotion thresholds | Phase 5 | Start at 10 clean releases / 14-day escaped-defect window; revisit with data. |
 | Evidence signing key | Phase 1a | **Done in 1a:** a local key file in `$LOCAL_FACTORY_HOME` (0600, created if missing, never silently replaced); rotate on demand. Enforcement relies on commit statuses, not on the key. |

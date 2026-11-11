@@ -1,9 +1,14 @@
 """The backend contract every agent runtime implements (docs/PLAN.md §11).
 
-A backend runs one role against one task inside one worker directory and reports what happened as
-an `AgentResult`. Backends never own workflow state: the orchestrator records results in the
-ledger and decides what happens next. Nothing safety- or correctness-critical depends on a
-backend capability.
+A backend runs one role against one task on one worker and reports what happened as an
+`AgentResult`. Backends never own workflow state: the orchestrator records results in the ledger
+and decides what happens next. Nothing safety- or correctness-critical depends on a backend
+capability.
+
+Brain on the host, hands in the box (docs/specs/phase-1b.md): a backend decides in the factory
+process and *acts* on its worker only through `WorkerHandle.tools()`, a `ToolExecutor`. In
+production that executor runs every operation inside the sandbox and `work_dir` is a path inside
+the box, not on the host.
 """
 
 from __future__ import annotations
@@ -15,6 +20,8 @@ from typing import Literal, Protocol, Self, get_args, runtime_checkable
 
 from pydantic import BaseModel, Field, JsonValue, model_validator
 
+from local_factory.agents.local import LocalExecutor
+from local_factory.agents.tools import ToolExecutor
 from local_factory.models import (
     TASK_ID_PATTERN,
     TICKET_ID_PATTERN,
@@ -72,9 +79,22 @@ class AgentTask(FrozenModel):
 
 @dataclass(frozen=True)
 class WorkerHandle:
-    """The worker directory a backend operates in (inside the sandbox in production)."""
+    """The worker a backend operates on.
+
+    ``work_dir`` is the worker's root as the tools see it: a directory on the host for a local
+    worker, a path inside the box (``/work``) for a sandboxed one. ``executor`` carries out the
+    backend's actions; without one, a :class:`LocalExecutor` on ``work_dir`` does (in-process
+    tests and the Phase 1a host slice only: not a security boundary).
+    """
 
     work_dir: Path
+    executor: ToolExecutor | None = None
+
+    def tools(self) -> ToolExecutor:
+        """The executor every file and command action on this worker must go through."""
+        if self.executor is not None:
+            return self.executor
+        return LocalExecutor(self.work_dir)
 
 
 class AgentResult(FrozenModel):

@@ -149,8 +149,9 @@ def test_tree_writer_root_must_not_be_a_symlink(tmp_path: Path) -> None:
 
 
 def test_bundle_limits_defaults() -> None:
-    assert BundleLimits() == BundleLimits(50, 5_000_000, 50_000_000)
+    assert BundleLimits() == BundleLimits(50, 5_000_000, 50_000_000, 100_000_000)
     assert BundleLimits() == bundles.DEFAULT_LIMITS
+    assert BundleLimits().max_bundle_bytes == 100_000_000
 
 
 def test_bundle_rejected_fields() -> None:
@@ -166,23 +167,32 @@ def test_import_result_is_frozen() -> None:
         result.head_sha = "x"  # type: ignore[misc]  # asserting immutability at runtime
 
 
+CAP = bundles.DEFAULT_LIMITS.max_bundle_bytes
+
+
+def _scratch(tmp_path: Path) -> Path:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(exist_ok=True)
+    return scratch
+
+
 def test_private_copy_copies_regular_file(tmp_path: Path) -> None:
     source = tmp_path / "task.bundle"
     source.write_bytes(b"bundle bytes")
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    copy = bundles._private_copy(source, scratch)
+    scratch = _scratch(tmp_path)
+    copy = bundles._private_copy(source, scratch, max_bytes=CAP)
     assert copy.parent == scratch and copy.read_bytes() == b"bundle bytes"
     source.write_bytes(b"swapped later")
     assert copy.read_bytes() == b"bundle bytes"
 
 
-def _rejected_copy(path: Path, tmp_path: Path) -> BundleRejected:
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(exist_ok=True)
+def _rejected_copy(
+    path: Path, tmp_path: Path, *, max_bytes: int = CAP, code: str = "invalid_bundle"
+) -> BundleRejected:
+    scratch = _scratch(tmp_path)
     with pytest.raises(BundleRejected) as exc:
-        bundles._private_copy(path, scratch)
-    assert exc.value.code == "invalid_bundle"
+        bundles._private_copy(path, scratch, max_bytes=max_bytes)
+    assert exc.value.code == code
     assert list(scratch.iterdir()) == []
     return exc.value
 
@@ -206,6 +216,60 @@ def test_private_copy_refuses_directory_and_missing(tmp_path: Path) -> None:
     directory.mkdir()
     assert "not a regular file" in _rejected_copy(directory, tmp_path).detail
     assert "cannot open" in _rejected_copy(tmp_path / "missing.bundle", tmp_path).detail
+
+
+# --------------------------------------------------------------------------- bundle size cap
+
+
+def test_private_copy_size_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "task.bundle"
+    source.write_bytes(b"x" * 100)
+    copy = bundles._private_copy(source, _scratch(tmp_path), max_bytes=100)
+    assert copy.read_bytes() == b"x" * 100
+    copy.unlink()
+    rejection = _rejected_copy(source, tmp_path, max_bytes=99, code="bundle_too_large")
+    assert rejection.detail == "bundle is 100 bytes, limit 99"  # nothing was copied
+
+
+def test_an_unopenable_bundle_is_invalid_whatever_the_cap(tmp_path: Path) -> None:
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"x" * 100)
+    link = tmp_path / "task.bundle"
+    link.symlink_to(secret)
+    assert "cannot open" in _rejected_copy(link, tmp_path, max_bytes=0).detail
+    missing = tmp_path / "missing.bundle"
+    assert "cannot open" in _rejected_copy(missing, tmp_path, max_bytes=0).detail
+    fifo = tmp_path / "fifo.bundle"
+    os.mkfifo(fifo)  # size 0: within any cap, and still not a regular file
+    assert "not a regular file" in _rejected_copy(fifo, tmp_path, max_bytes=0).detail
+
+
+def test_a_bundle_that_grows_while_being_copied_is_cut_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fstat claims the file fits under the cap; the copy itself still stops at the cap."""
+    source = tmp_path / "task.bundle"
+    source.write_bytes(b"x" * 100)
+    real_fstat = os.fstat
+
+    def stale_fstat(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != 100:
+            return info
+        fields = list(info[:10])
+        fields[stat.ST_SIZE] = 0  # as it was before the worker kept writing
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", stale_fstat)
+    scratch = _scratch(tmp_path)
+    with pytest.raises(BundleRejected) as exc:
+        bundles._private_copy(source, scratch, max_bytes=99)
+    assert (exc.value.code, exc.value.detail) == (
+        "bundle_too_large",
+        "bundle is at least 100 bytes, limit 99",
+    )
+    (partial,) = scratch.iterdir()  # the caller's temporary directory removes it
+    assert partial.stat().st_size <= 99
 
 
 # --------------------------------------------------------------------------- integrate

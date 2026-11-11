@@ -118,6 +118,85 @@ def test_bundle_file_must_be_a_regular_file(
     rejected(repo, tmp_path, base, git, "invalid_bundle")  # a directory
 
 
+# --------------------------------------------------------------------------- the size cap
+
+
+def test_default_bundle_cap() -> None:
+    assert BundleLimits().max_bundle_bytes == 100_000_000
+
+
+def test_rejection_reads_as_code_and_detail() -> None:
+    rejection = BundleRejected("bundle_too_large", "bundle is 9 bytes, limit 8")
+    assert (rejection.code, rejection.detail) == ("bundle_too_large", "bundle is 9 bytes, limit 8")
+    assert str(rejection) == "bundle_too_large: bundle is 9 bytes, limit 8"
+
+
+def test_bundle_size_boundary(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    commit_all(work, "x")
+    bundle = bundle_of(work, base, tmp_path)
+    size = bundle.stat().st_size
+    detail = rejected(
+        repo, bundle, base, git, "bundle_too_large", BundleLimits(max_bundle_bytes=size - 1)
+    )
+    assert detail == f"bundle is {size} bytes, limit {size - 1}"
+    accepted(repo, bundle, base, BundleLimits(max_bundle_bytes=size))
+
+
+def test_bundle_size_is_checked_before_every_other_code(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    commit_all(work, "x")
+    git("branch", "extra", cwd=work)
+    unexpected = git_bundle(git, work, tmp_path / "two.bundle", "refs/heads/task", "extra")
+    rejected(repo, unexpected, base, git, "unexpected_refs")
+    tiny = BundleLimits(max_bundle_bytes=16)
+    rejected(repo, unexpected, base, git, "bundle_too_large", tiny)
+
+
+def test_an_unopenable_bundle_is_invalid_whatever_the_cap(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    write(work, {"x.txt": "x\n"})
+    commit_all(work, "x")
+    link = tmp_path / "link.bundle"
+    link.symlink_to(bundle_of(work, base, tmp_path))
+    nothing = BundleLimits(max_bundle_bytes=0)
+    assert "cannot open" in rejected(repo, link, base, git, "invalid_bundle", nothing)
+    rejected(repo, tmp_path / "missing.bundle", base, git, "invalid_bundle", nothing)
+
+
+def test_unreadable_bundle_is_invalid(repo: BareRepo, base: str, tmp_path: Path, git: Git) -> None:
+    garbage = tmp_path / "garbage.bundle"
+    garbage.write_bytes(b"not a bundle\n")
+    assert rejected(repo, garbage, base, git, "invalid_bundle")  # git's reason, not empty
+
+
+def test_bundle_with_missing_prerequisites_is_invalid(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    write(work, {"x.txt": "1\n"})
+    unknown = commit_all(work, "not in the factory repo")
+    assert unknown is not None
+    write(work, {"x.txt": "2\n"})
+    commit_all(work, "on top")
+    bundle = git_bundle(git, work, tmp_path / "prereq.bundle", "refs/heads/task", f"^{unknown}")
+    assert rejected(repo, bundle, base, git, "invalid_bundle")
+
+
+def test_bundle_of_the_unchanged_base_has_no_changes(
+    repo: BareRepo, base: str, work: Path, tmp_path: Path, git: Git
+) -> None:
+    bundle = git_bundle(git, work, tmp_path / "same.bundle", "refs/heads/task")
+    assert (
+        rejected(repo, bundle, base, git, "no_changes")
+        == f"the task head is the base commit {base}"
+    )
+
+
 def test_bundle_without_refs(repo: BareRepo, base: str, tmp_path: Path, git: Git) -> None:
     bundle = tmp_path / "empty.bundle"
     bundle.write_bytes(b"# v2 git bundle\n\n")

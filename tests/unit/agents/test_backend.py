@@ -18,6 +18,8 @@ from local_factory.agents.backend import (
     RoleSpec,
     WorkerHandle,
 )
+from local_factory.agents.local import LocalExecutor
+from local_factory.agents.tools import ToolExecutor
 from local_factory.models import Halt, HaltReason, Tier, Usage
 
 
@@ -134,6 +136,23 @@ def test_worker_handle_is_frozen(tmp_path: Path) -> None:
     handle = WorkerHandle(work_dir=tmp_path)
     with pytest.raises(dataclasses.FrozenInstanceError):
         assign(handle, "work_dir", tmp_path / "x")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        assign(handle, "executor", None)
+
+
+def test_worker_handle_tools_default_to_a_local_executor_on_work_dir(tmp_path: Path) -> None:
+    handle = WorkerHandle(work_dir=tmp_path)
+    assert handle.executor is None
+    tools = handle.tools()
+    assert isinstance(tools, LocalExecutor)
+    assert tools.root == tmp_path
+    assert isinstance(tools, ToolExecutor)
+
+
+def test_worker_handle_tools_are_the_given_executor() -> None:
+    executor = LocalExecutor(Path("/elsewhere"))
+    handle = WorkerHandle(work_dir=Path("/work"), executor=executor)
+    assert handle.tools() is executor
 
 
 # --------------------------------------------------------------------------- AgentResult

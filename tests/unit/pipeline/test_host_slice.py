@@ -15,7 +15,7 @@ import pytest
 
 from local_factory.agents import FakeBackend
 from local_factory.config import ConfigError, FactoryConfig, ProjectConfig
-from local_factory.gitops import BareRepo
+from local_factory.gitops import BareRepo, BundleLimits
 from local_factory.ledger import Ledger, TicketNotFound
 from local_factory.models import (
     Contract,
@@ -40,7 +40,8 @@ from local_factory.pipeline import (
     reconcile_criteria,
     run_host_slice,
 )
-from local_factory.pipeline.host_slice import FAKE_MODEL, UNREPORTED, _frozen, _models
+from local_factory.pipeline.flow import FAKE_MODEL, UNREPORTED, _frozen, _models
+from local_factory.pipeline.host_slice import _HostSite
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 ORACLE = "sha256:" + "a" * 64
@@ -162,6 +163,22 @@ def test_a_ticket_without_a_frozen_contract_is_refused() -> None:
     )
     with pytest.raises(SliceError, match="no frozen contract"):
         _frozen(ticket)
+
+
+# --------------------------------------------------------------------------- the host site
+
+
+def test_the_host_site_has_no_run_limit_no_image_and_the_default_bundle_caps() -> None:
+    site = _HostSite()
+    assert site.run_limit_s is None
+    assert site.limits == BundleLimits()
+    assert site.image_digests() == {}
+    site.check()  # nothing to check, nothing to raise
+
+
+def test_the_host_slice_says_it_is_not_a_security_boundary() -> None:
+    assert run_host_slice.__doc__ is not None
+    assert "not a security boundary" in run_host_slice.__doc__.lower()
 
 
 # --------------------------------------------------------------------------- preconditions

@@ -210,3 +210,44 @@ def test_run_git_check_raises_with_decoded_stderr(recorder: Recorder) -> None:
 def test_run_git_without_check_returns_failure(recorder: Recorder) -> None:
     recorder.result = (1, b"", b"nope")
     assert run_git(["diff", "--quiet"], check=False).returncode == 1
+
+
+def test_run_git_streams_stdout_to_a_file_descriptor(recorder: Recorder, tmp_path: Path) -> None:
+    recorder.result = (0, b"", b"")
+    result = run_git(["bundle", "create", "-", "HEAD"], git_dir=tmp_path / "w.git", stdout_fd=7)
+    [(argv, kwargs)] = recorder.calls
+    assert argv == [
+        "git",
+        *HARDENING_FLAGS,
+        f"--git-dir={tmp_path / 'w.git'}",
+        "bundle",
+        "create",
+        "-",
+        "HEAD",
+    ]
+    assert kwargs["stdout"] == 7 and kwargs["stderr"] is subprocess.PIPE
+    assert "capture_output" not in kwargs
+    assert kwargs["cwd"] == neutral_dir()
+    assert kwargs["stdin"] is subprocess.DEVNULL and kwargs["input"] is None
+    assert kwargs["env"] == git_env() and kwargs["check"] is False
+    assert result.returncode == 0
+
+
+def test_run_git_streamed_failure_raises_with_stderr(recorder: Recorder) -> None:
+    recorder.result = (128, b"", b"fatal: Refusing to create empty bundle.\n")
+    with pytest.raises(GitError) as exc:
+        run_git(["bundle", "create", "-", "HEAD"], stdout_fd=1)
+    assert (exc.value.returncode, exc.value.stderr) == (
+        128,
+        "fatal: Refusing to create empty bundle.\n",
+    )
+    recorder.result = (128, b"", b"x")
+    assert run_git(["bundle", "create", "-", "HEAD"], stdout_fd=1, check=False).returncode == 128
+
+
+def test_run_git_streams_for_real(tmp_path: Path) -> None:
+    out = tmp_path / "version.txt"
+    with out.open("wb") as fh:
+        result = run_git(["--version"], stdout_fd=fh.fileno())
+    assert result.stdout is None
+    assert out.read_text().startswith("git version ")

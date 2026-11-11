@@ -42,7 +42,10 @@ from local_factory.models import (
     TicketStatus,
     TicketType,
 )
-from local_factory.pipeline import SliceOutcome, run_host_slice
+from local_factory.pipeline import SliceOutcome, run_host_slice, run_sandboxed_slice
+from local_factory.sandbox import Sandbox
+from local_factory.sandbox.runtime import DockerRuntime, SandboxError
+from tests.acceptance.conftest import BOX_IMAGE, docker_objects, small_sandbox_config
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "cli-target"
@@ -229,27 +232,35 @@ class World:
         main_ref: str = MAIN,
         factory_config: FactoryConfig | None = None,
         key: bytes | None = None,
+        sandbox: Sandbox | None = None,
     ) -> Coroutine[Any, Any, SliceOutcome]:
-        return run_host_slice(
-            ledger=self.ledger,
-            repo=self.repo,
-            project=self.project,
-            backend=backend,
-            ticket_id=self.ticket_id,
-            work_root=self.work_root,
-            key=self.key if key is None else key,
-            main_ref=main_ref,
-            clock=lambda: T0,
-            factory_config=factory_config,
-        )
+        """The slice as a coroutine: sandboxed with ``sandbox``, else the host slice."""
+        common: dict[str, Any] = {
+            "ledger": self.ledger,
+            "repo": self.repo,
+            "project": self.project,
+            "backend": backend,
+            "ticket_id": self.ticket_id,
+            "work_root": self.work_root,
+            "key": self.key if key is None else key,
+            "main_ref": main_ref,
+            "clock": lambda: T0,
+            "factory_config": factory_config,
+        }
+        if sandbox is None:
+            return run_host_slice(**common)
+        return run_sandboxed_slice(sandbox=sandbox, **common)
 
     def run(self, backend: FakeBackend, **kwargs: Any) -> SliceOutcome:
         return asyncio.run(self.start(backend, **kwargs))
 
     def run_scripts(
-        self, implementer: Sequence[Action], verifier: Sequence[Action] = VERIFIER_PASS
+        self,
+        implementer: Sequence[Action],
+        verifier: Sequence[Action] = VERIFIER_PASS,
+        **kwargs: Any,
     ) -> SliceOutcome:
-        return self.run(FakeBackend({"implementer": implementer, "verifier": verifier}))
+        return self.run(FakeBackend({"implementer": implementer, "verifier": verifier}), **kwargs)
 
     def advance_main(self, files: Mapping[str, str], message: str = "main moved") -> str:
         """Commit `files` on the target's main and fetch it into the bare repo (fast-forward)."""
@@ -291,6 +302,15 @@ class World:
                 assert isinstance(status, str)
                 ends[task_id] = TaskEnd(TaskStatus(status), reason, detail)
         return ends
+
+    def work_root_oddities(self) -> list[str]:
+        """What under the work root is neither a directory nor a regular ``.bundle`` file."""
+        odd = []
+        for path in sorted(self.work_root.rglob("*")):
+            is_bundle = path.is_file() and not path.is_symlink() and path.suffix == ".bundle"
+            if not (path.is_dir() and not path.is_symlink()) and not is_bundle:
+                odd.append(str(path.relative_to(self.work_root)))
+        return odd
 
     def assert_boundaries(self) -> None:
         """The slice never moves main and leaves no quarantine or temporary base refs behind."""
@@ -342,3 +362,24 @@ def world(tmp_path: Path, git: Git) -> Iterator[World]:
             git=git,
             initial_events=len(ledger.events(ticket.id)),
         )
+
+
+# --------------------------------------------------------------------------- real containers
+
+
+@pytest.fixture
+def docker_runtime() -> Iterator[DockerRuntime]:
+    """A runtime of its own for one container test; whatever it created must be gone afterwards."""
+    runtime = DockerRuntime()
+    try:
+        runtime.check(BOX_IMAGE)
+    except SandboxError as exc:
+        pytest.fail(f"container tests need Docker and {BOX_IMAGE} (scripts/build-images): {exc}")
+    yield runtime
+    runtime.cleanup()
+    assert docker_objects(runtime.instance) == ([], []), "the runtime left objects behind"
+
+
+@pytest.fixture
+def real_sandbox(docker_runtime: DockerRuntime) -> Sandbox:
+    return Sandbox(docker_runtime, small_sandbox_config())

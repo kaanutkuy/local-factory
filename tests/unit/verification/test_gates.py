@@ -12,9 +12,17 @@ from pathlib import Path
 import pytest
 
 from local_factory.config import ProjectConfig
-from local_factory.models import GateStatus
+from local_factory.models import GateResult, GateStatus
 from local_factory.verification import gates
-from local_factory.verification.gates import GateSpec, gates_from_project, run_gate, run_gates
+from local_factory.verification.gates import (
+    NOTE_PREFIX,
+    GateSpec,
+    OutputTail,
+    gates_from_project,
+    run_gate,
+    run_gates,
+    skipped_result,
+)
 
 G = GateStatus
 
@@ -414,3 +422,34 @@ def test_without_fail_fast_every_gate_runs(tmp_path: Path) -> None:
     results = run_gates(specs, cwd=tmp_path)
     assert [(r.status, r.exit_code) for r in results] == [(G.FAIL, 2), (G.PASS, 0)]
     assert (tmp_path / "ran-unit").exists()
+
+
+# --------------------------------------------------------------------------- shared helpers
+
+
+def test_skipped_result_is_what_fail_fast_records(tmp_path: Path) -> None:
+    stopper = GateResult(name="lint", status=G.ERROR)
+    assert skipped_result(GateSpec("unit", "pytest"), stopper) == GateResult(
+        name="unit",
+        status=G.SKIPPED,
+        output_tail=(
+            "[local-factory] not run: gate 'lint' finished with status 'error' and fail_fast is set"
+        ),
+    )
+    first, skipped = run_gates(
+        [GateSpec("lint", "exit 1"), GateSpec("unit", "echo ran")], cwd=tmp_path, fail_fast=True
+    )
+    assert skipped == skipped_result(GateSpec("unit", "echo ran"), first)
+
+
+def test_output_tail_keeps_whole_characters_and_prefixes_notes() -> None:
+    assert NOTE_PREFIX == "[local-factory] "
+    tail = OutputTail(8)
+    tail.feed("é".encode() * 5)  # 10 bytes: the last 8 are four whole characters
+    assert tail.text() == "éééé"
+    tail.feed(b"x")  # now the cut falls inside an "é": its stray byte is dropped
+    assert tail.text() == "éééx"
+    noted = OutputTail(100)
+    noted.feed(b"out")
+    noted.note("done")
+    assert noted.text() == "out\n[local-factory] done\n"

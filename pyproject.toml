@@ -55,6 +55,7 @@ norecursedirs = [".*", "fixtures"]
 addopts = "-ra --strict-markers"
 markers = [
     "integration: uses real git repositories and subprocesses",
+    "container: runs Docker containers from the sandbox image (scripts/build-images); fails, never skips, without them",
     "live: spends real LLM tokens; opt-in only",
 ]
 

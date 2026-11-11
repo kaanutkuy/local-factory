@@ -139,26 +139,45 @@ def run_git(
     cwd: Path | None = None,
     input: bytes | None = None,
     check: bool = True,
+    stdout_fd: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``git <hardening flags> [--git-dir=<git_dir>] <args>`` and capture its output.
 
     ``git_dir`` is passed as an absolute ``--git-dir`` (no repository discovery). ``cwd`` defaults
     to :func:`neutral_dir`. stdin is ``input`` or empty, so git can never block on a terminal.
     With ``check`` (the default) a non-zero exit raises :class:`GitError`.
+
+    ``stdout_fd`` streams git's stdout to that file descriptor instead of capturing it (the
+    result's ``stdout`` is then None); stderr is still captured. The box uses this to write a
+    bundle straight to its standard output (``git bundle create -``) without buffering it.
     """
     argv = ["git", *HARDENING_FLAGS]
     if git_dir is not None:
         argv.append(f"--git-dir={Path(git_dir).absolute()}")
     argv.extend(args)
-    result = subprocess.run(
-        argv,
-        cwd=cwd if cwd is not None else neutral_dir(),
-        env=git_env(),
-        input=input,
-        stdin=subprocess.DEVNULL if input is None else None,
-        capture_output=True,
-        check=False,
-    )
+    workdir = cwd if cwd is not None else neutral_dir()
+    stdin = subprocess.DEVNULL if input is None else None
+    if stdout_fd is None:
+        result = subprocess.run(
+            argv,
+            cwd=workdir,
+            env=git_env(),
+            input=input,
+            stdin=stdin,
+            capture_output=True,
+            check=False,
+        )
+    else:
+        result = subprocess.run(
+            argv,
+            cwd=workdir,
+            env=git_env(),
+            input=input,
+            stdin=stdin,
+            stdout=stdout_fd,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
     if check and result.returncode != 0:
         raise GitError(args, result.returncode, result.stderr.decode("utf-8", "replace"))
     return result

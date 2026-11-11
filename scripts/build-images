@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Build the sandbox image the container tests and the factory use. Needs network (base image,
+# apt, pip) the first time; afterwards the layer cache makes it a no-op. Orchestrator-owned.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+image="${LOCAL_FACTORY_SANDBOX_IMAGE:-local-factory/sandbox:v1}"
+docker build --quiet --tag "$image" docker/sandbox >/dev/null
+echo "built $image ($(docker image inspect --format '{{.Id}}' "$image"))"

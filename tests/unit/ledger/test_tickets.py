@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from itertools import pairwise
 from pathlib import Path
+from typing import cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from local_factory.ledger import IllegalTransition, Ledger, LedgerError, TicketNotFound
 from local_factory.ledger.state_machine import TERMINAL, allowed_targets
@@ -150,6 +152,52 @@ def test_reason_defaults_to_empty(ledger: Ledger) -> None:
     ticket = new_ticket(ledger)
     ledger.transition(ticket.id, S.TRIAGED, actor="triage")
     assert ledger.events(ticket.id)[-1].data == {"reason": ""}
+
+
+def test_transition_records_structured_detail(db_path: Path, clock: FakeClock) -> None:
+    detail: dict[str, JsonValue] = {
+        "conflicts": ["src/a.py", "src/b.py"],
+        "round": 2,
+        "nested": {"ok": False, "ratio": 0.5, "none": None},
+    }
+    with Ledger(db_path, clock=clock) as led:
+        ticket = walk_to(led, new_ticket(led).id, S.CONVERGED)
+        led.transition(
+            ticket.id, S.BUILDING, actor="factory", reason="candidate_conflict", data=detail
+        )
+        detail["mutated_after_the_call"] = True  # the ledger keeps its own copy
+    with Ledger(db_path, clock=clock) as led:
+        last = led.events(ticket.id)[-1]
+    assert (last.kind, last.from_status, last.to_status) == ("transition", S.CONVERGED, S.BUILDING)
+    assert last.data == {
+        "reason": "candidate_conflict",
+        "detail": {
+            "conflicts": ["src/a.py", "src/b.py"],
+            "round": 2,
+            "nested": {"ok": False, "ratio": 0.5, "none": None},
+        },
+    }
+
+
+def test_empty_detail_is_recorded_as_given(ledger: Ledger) -> None:
+    ticket = new_ticket(ledger)
+    ledger.transition(ticket.id, S.TRIAGED, actor="triage", data={})
+    assert ledger.events(ticket.id)[-1].data == {"reason": "", "detail": {}}
+
+
+@pytest.mark.parametrize("bad", [object(), math.nan, math.inf])
+def test_non_json_detail_rolls_back_the_transition(ledger: Ledger, bad: object) -> None:
+    ticket = new_ticket(ledger)
+    events = ledger.events()
+    with pytest.raises(ValidationError):
+        ledger.transition(
+            ticket.id,
+            S.TRIAGED,
+            actor="triage",
+            data=cast("dict[str, JsonValue]", {"value": bad}),
+        )
+    assert ledger.get_ticket(ticket.id) == ticket
+    assert ledger.events() == events
 
 
 def test_transition_of_unknown_ticket(ledger: Ledger) -> None:

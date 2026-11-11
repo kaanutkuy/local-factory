@@ -1,12 +1,13 @@
 """Host side of the worker boundary: base bundles out, task bundles in.
 
 ``import_task_bundle`` treats the bundle as hostile data. It never touches the worker's directory:
-it copies the bundle file (refusing symlinks and non-regular files) into a private temporary
-directory and runs every git command against the factory's bare repository on that copy. The
-bundle is fetched into a uniquely named quarantine ref and validated there; the destination ref
-is only set, atomically with the quarantine ref's deletion, once every check has passed. A
-``finally`` clause deletes the quarantine ref on every other path, so a rejection (or any
-unexpected error) leaves no ref behind.
+it checks the bundle file's size against ``BundleLimits.max_bundle_bytes`` before reading any of
+it, copies it (refusing symlinks and non-regular files, and stopping at the cap) into a private
+temporary directory and runs every git command against the factory's bare repository on that
+copy. The bundle is fetched into a uniquely named quarantine ref and validated there; the
+destination ref is only set, atomically with the quarantine ref's deletion, once every check has
+passed. A ``finally`` clause deletes the quarantine ref on every other path, so a rejection (or
+any unexpected error) leaves no ref behind.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class BundleLimits:
     max_commits: int = 50
     max_file_bytes: int = 5_000_000
     max_total_bytes: int = 50_000_000
+    max_bundle_bytes: int = 100_000_000  # the bundle file itself, checked before it is read
 
 
 DEFAULT_LIMITS = BundleLimits()
@@ -107,7 +109,7 @@ def import_task_bundle(
         raise ValueError(f"dest_ref must not be a quarantine ref: {dest_ref}")
     base = repo.rev_parse(f"{base_sha}^{{commit}}")
     with tempfile.TemporaryDirectory(prefix="local-factory-import-") as scratch:
-        copy = _private_copy(bundle, Path(scratch))
+        copy = _private_copy(bundle, Path(scratch), max_bytes=limits.max_bundle_bytes)
         _check_heads(repo, copy)
         _verify(repo, copy)
         quarantine = f"{QUARANTINE_PREFIX}{uuid.uuid4().hex}"
@@ -125,23 +127,39 @@ def import_task_bundle(
             repo.delete_ref(quarantine)  # no-op after a successful transaction
 
 
-def _private_copy(bundle: Path, scratch: Path) -> Path:
-    """Copy the bundle into factory-owned storage, so nothing can swap it under us."""
+def _private_copy(bundle: Path, scratch: Path, *, max_bytes: int) -> Path:
+    """Copy the bundle into factory-owned storage, so nothing can swap it under us.
+
+    The size cap comes first, on the opened file and before a single byte is copied; the copy
+    stops at the cap too, in case the file grows while it is being read.
+    """
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
         fd = os.open(bundle, flags)
     except OSError as exc:
         raise BundleRejected("invalid_bundle", f"cannot open bundle: {exc.strerror}") from exc
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if info.st_size > max_bytes:
+            raise _too_large(info.st_size, max_bytes)
+        if not stat.S_ISREG(info.st_mode):
             raise BundleRejected("invalid_bundle", "bundle is not a regular file")
         copy = scratch / "task.bundle"
+        copied = 0
         with copy.open("xb") as target:
             while chunk := os.read(fd, _COPY_CHUNK):
+                copied += len(chunk)
+                if copied > max_bytes:
+                    raise _too_large(copied, max_bytes, at_least=True)
                 target.write(chunk)
     finally:
         os.close(fd)
     return copy
+
+
+def _too_large(size: int, max_bytes: int, *, at_least: bool = False) -> BundleRejected:
+    shown = f"at least {size}" if at_least else str(size)
+    return BundleRejected("bundle_too_large", f"bundle is {shown} bytes, limit {max_bytes}")
 
 
 def _stderr(exc: GitError) -> str:

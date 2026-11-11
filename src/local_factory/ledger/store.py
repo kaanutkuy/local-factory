@@ -154,9 +154,18 @@ class Ledger:
         return [Ticket.model_validate_json(row["body"]) for row in rows]
 
     def transition(
-        self, ticket_id: str, to: TicketStatus, *, actor: str, reason: str = ""
+        self,
+        ticket_id: str,
+        to: TicketStatus,
+        *,
+        actor: str,
+        reason: str = "",
+        data: Mapping[str, JsonValue] | None = None,
     ) -> Ticket:
         """Move a ticket along the state machine.
+
+        The event's data is `{"reason": reason}`, plus `"detail": {...data}` when `data` is given
+        (e.g. a candidate conflict's paths), so the ledger alone explains the change.
 
         Rejected with `IllegalTransition`: anything not in the table, `to=HALTED` (use `halt()`),
         any transition of a HALTED ticket (use `resume()`), and `to=APPROVED` while the contract
@@ -173,7 +182,9 @@ class Ledger:
                     f"{ticket_id}: approve with freeze_contract(), which freezes the contract"
                 )
             self._check(ticket, to)
-            return self._apply_transition(ticket, to, actor=actor, reason=reason, now=self._clock())
+            return self._apply_transition(
+                ticket, to, actor=actor, reason=reason, data=data, now=self._clock()
+            )
 
     # ------------------------------------------------------------------ contract
 
@@ -602,9 +613,19 @@ class Ledger:
             raise IllegalTransition(f"{ticket.id}: {exc}") from exc
 
     def _apply_transition(
-        self, ticket: Ticket, to: TicketStatus, *, actor: str, reason: str, now: datetime
+        self,
+        ticket: Ticket,
+        to: TicketStatus,
+        *,
+        actor: str,
+        reason: str,
+        now: datetime,
+        data: Mapping[str, JsonValue] | None = None,
     ) -> Ticket:
         updated = self._save_ticket(ticket, now, status=to)
+        event_data: dict[str, JsonValue] = {"reason": reason}
+        if data is not None:
+            event_data["detail"] = dict(data)  # a copy: the caller's mapping is not kept
         self._append_event(
             at=now,
             kind="transition",
@@ -612,7 +633,7 @@ class Ledger:
             ticket_id=ticket.id,
             from_status=ticket.status,
             to_status=to,
-            data={"reason": reason},
+            data=event_data,
         )
         return updated
 
