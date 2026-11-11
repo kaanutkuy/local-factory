@@ -1,7 +1,8 @@
 # local-factory v1 — design and implementation plan
 
-Status: **proposal v1.2**, 2026-11-11 (v1.2: the Phase 1b box has no network; agent placement
-is decided in Phase 2, see §5.3). Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
+Status: **proposal v1.3**, 2026-11-11 (v1.3: agent placement decided, **option A**: the model loop
+runs on the host and its tools execute in the box, see §5.3; v1.2: the Phase 1b box has no
+network). Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
 Decisions recorded here came from an interview with the project owner plus one external design
 review; open decisions are listed in §15.
 
@@ -19,9 +20,9 @@ review; open decisions are listed in §15.
   owns state, budgets, escalation, stop conditions and release decisions.
 - **The sandbox is the security boundary.** Every worker action runs in a hardened container with
   **no network**, as a user that is neither root nor the host user, on a standalone git clone, with
-  no credentials. How a model-driven agent reaches its model (a host-side loop acting through the
-  box, or an in-box agent behind a broker) is decided in Phase 2 (§5.3). Hooks and prompts are
-  defense-in-depth.
+  no credentials. **Brain on the host, hands in the box** (decided 2026-11-11, §5.3): the model loop
+  runs in the factory process, the only place the API key exists, and every tool call the model
+  makes executes in the box. No broker, no egress proxy. Hooks and prompts are defense-in-depth.
 - **Evidence is bound to an exact commit.** No stale verification result can authorize new code.
 - **Autonomy is earned.** R0/R1 changes ship dark after contract approval; R2 (auth, payments, data,
   migrations) holds for approval until a measured track record promotes it.
@@ -42,6 +43,15 @@ review; open decisions are listed in §15.
 | Release | R0–R2 all dark | R0/R1 dark; R2 holds until promoted by a measured rule; destructive migrations always hold; expand/contract, backups, canary, monitoring (§7). |
 | Models & pricing | in role table | In factory config; roles reference tiers only (§9, §12). |
 | Phase 1 | spine without containers | Vertical slice: one ticket, one container, one commit, one verify, one integration, plus the boundary red-team (§14). |
+
+### Changes in v1.2 and v1.3 (2026-11-11)
+
+| Area | v1.1 | Now |
+|---|---|---|
+| Network | internal network + egress proxy (allowlisted registries, broker) | **The box has no network at all** (`--network none`); dependencies are pre-baked or read-only caches (v1.2, §5.3). |
+| Agent placement | agent in the container, model via a broker | **Option A** (v1.3): model loop on the host with the official `anthropic` SDK; Anthropic's `bash` and text-editor tools execute in the box through `ToolExecutor` (§5.3). |
+| Credentials | broker with run-scoped tokens; broker metering authoritative | The API key exists only in the host process and never enters the box; the factory meters usage from API responses (§5.3, §10). |
+| Backend | `ClaudeAgentSDKBackend` | `ClaudeAPIBackend` (§11). The Claude Agent SDK is not used on the host (§5.3, rejected variant). |
 
 ---
 
@@ -125,7 +135,7 @@ greet/slugify survive as a **fixture target repo** for the factory's own tests.
 ┌───────┴─────────────────────── ORACLE ──────────────┴───────────────────────────────────┐       │
 │ frozen contract (ACs, NFRs)  ·  visible acceptance tests (protected)  ·  sealed holdout │◀──────┘
 └─────────────────────────────────────────────────────────────────────────────────────────┘ learning loop
- LEDGER (state machine, events, costs, evidence) · SANDBOX (containers, egress proxy, model broker)
+ LEDGER (state machine, events, costs, evidence) · SANDBOX (network-less box; app/probe containers)
  POLICY (diff policy, role permissions, release policy) · MEMORY (logs, ADRs, lessons) · BACKENDS
 ```
 
@@ -231,10 +241,12 @@ pids/CPU/memory limits and per-command / per-run wall-clock limits · **`--netwo
 CLI itself runs with a minimal environment, so no host variable can reach a container. Outputs leave
 only as bounded data (a capped bundle stream, bounded text). Spec: `docs/specs/phase-1b.md`.
 
-Measured on this machine (Docker 29, 2026-11-11), for whenever a network is attached (option B):
-a plain `--internal` network still reaches host services bound to 0.0.0.0 via its gateway IP; with
+Measured on this machine (Docker 29, 2026-11-11), for whenever containers share a network (the
+Phase 3 app ↔ probe link; this was also part of why option B was rejected, §5.3): a plain
+`--internal` network still reaches host services bound to 0.0.0.0 via its gateway IP; with
 `com.docker.network.bridge.inhibit_ipv4=true` the host is unreachable, containers get no IPv6, peer
-DNS still works and external DNS is not forwarded.
+DNS still works and external DNS is not forwarded. Behaviour like this differs across Docker
+versions and platforms; `--network none` does not.
 
 ### 5.3 Network and model access
 
@@ -242,32 +254,110 @@ DNS still works and external DNS is not forwarded.
 else: no installs, no connections. Dependencies come pre-baked in the image or as read-only caches;
 adding one is a human-approved image change, never something an agent can do from the box.
 
-**Agent placement is decided in Phase 2** (§15), while building the Claude backend:
+**Agent placement: decided 2026-11-11 by the project owner — option A, brain on the host, hands in
+the box.** The comparison below was made with publication as an open-source project in mind, which
+weighed in A's favour. Phase 2 builds it; this section is the brief for the Phase 2 spec.
 
-- **A — brain on the host, hands in the box.** The model loop runs in the factory process (the only
-  place the provider key exists); every tool call (write/read/delete a file, run a command) goes
-  through `ToolExecutor` into the box. No broker, no egress path. Costs: the backend's built-in tools
-  must all be disabled so nothing acts as the host user (enforce with a startup check + red-team
-  test), and the agent gets factory-provided tools instead of native ones. Budget is metered from
-  API responses the box never touches.
-- **B — the whole agent in the box**, reaching the model through a broker over an internal network
-  (below). Native tools, at the cost of the network/broker machinery.
+**How A works**
 
-The decisive questions: can the SDK be reliably restricted to factory tools (A), and how much does
-agent quality suffer with simpler tools. Option B's design, kept for that decision:
+- The model loop runs in the factory process on the host, the only place the provider API key
+  exists. It calls the Claude API with the official **`anthropic` Python SDK** (MIT; added to
+  `pyproject.toml` by the orchestrator in Phase 2), through the SDK's tool runner or a small
+  factory-owned loop. The key comes from the host environment and is never passed to the docker CLI
+  (`docker_env` is already minimal) or into any container.
+- Every tool call the model makes executes **in the box** through `ToolExecutor`
+  (`agents/tools.py`; `SandboxExecutor` in production, `LocalExecutor` in tests). The box keeps
+  `--network none`: no broker, no egress proxy, no network path out.
+- **Tools** are the Anthropic-defined client tools the models are trained on, declared by `type` and
+  `name` only (no `input_schema`; a custom tool merely named `bash` would not get the trained
+  behaviour):
+  - `{"type": "bash_20250124", "name": "bash"}`: input `{"command": "..."}` or `{"restart": true}`.
+    The factory runs `bash -c <command>` in the box (`run_command`, per-command timeout, output
+    capped at `max_output_bytes`) and returns combined stdout + stderr.
+  - `{"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}`: `command` is `view`
+    (`path`, optional `view_range`; a file's lines or a directory listing), `create` (`path`,
+    `file_text`), `str_replace` (`path`, `old_str`, `new_str`; exactly one match, else an error) or
+    `insert` (`path`, `insert_line`, `insert_text`; 0 = start of file). Optional `max_characters`
+    caps `view`. The factory implements it on top of `read_file` / `write_file` in the box, with every
+    path confined to `/work`.
+  - A tool error goes back as a `tool_result` with `is_error: true` so the model can recover. A tool
+    name the factory did not declare, or malformed input, is refused the same way. **Nothing the
+    model asks for ever executes on the host.**
+  - Role outputs (e.g. `TaskReport`) come back as structured output (`output_config.format`) or a
+    factory-defined tool with `strict: true`; decided in the Phase 2 spec.
 
-- **Egress proxy** (factory-owned) is the container's only route out. Allowlist: the model broker,
-  package registries (ideally through a caching proxy). Everything else is denied and logged.
-- **Model broker** (host): the backend points at it (Claude: `ANTHROPIC_BASE_URL`, i.e. the LLM-gateway
-  mode — verify against current docs in Phase 2). Each run gets a random token valid only for that
-  run, its allowed models and its remaining budget. The broker injects the real provider key,
-  meters usage from responses, and cuts the run off when the budget is spent. **Broker metering is
-  the authoritative budget**; the SDK's `max_budget_usd` is an estimate and is only a secondary guard.
-- Subscription-auth caveat: a broker fits API-key billing cleanly. If the factory runs on a Claude
-  subscription instead, the fallback is a short-lived token inside the container with egress
-  restricted to the provider host — a documented, accepted risk (§15).
-- GitHub and deploy credentials exist only in the release stage, which is deterministic host code.
-  They are never in a container and never in any LLM context.
+**Why A, not B** (B = the whole agent, e.g. Claude Code via the Agent SDK, inside the box, reaching
+the model through a key-injecting broker and an egress proxy over an internal network)
+
+- **A short, checkable security claim:** "the box has no network and never holds a key; the model
+  can only use the tools the factory declares, and they all run in the box." A reader can confirm it
+  from one file. Under B the box must reach the model, so the claim becomes "the box reaches only a
+  proxy, which reaches only Anthropic", and code in the box could still call the API on the user's
+  key: a malicious repo could run up their bill.
+- **Portability:** `--network none` behaves the same on Linux, macOS Docker Desktop, WSL2 and
+  rootless Docker. B relied on networking details that vary by Docker version and platform (§5.2
+  measurements); for a public project each difference becomes a support issue.
+- **Dependencies and licensing:** A adds only `anthropic` (MIT). B needs the Claude Code binary in
+  the image (the Agent SDK "runs the Claude Code binary"), which is governed by Anthropic's
+  Commercial Terms of Service, not an open-source license.
+- **Login is API key under either option:** "Unless previously approved, Anthropic does not allow
+  third party developers to offer claude.ai login or rate limits for their products, including
+  agents built on the Claude Agent SDK" (Agent SDK overview, read 2026-11-11). Users bring an API key;
+  this matches the billing decision (§15).
+- **Cost visibility:** every request and response passes through factory code, so per-run budgets,
+  metering and prompt caching are enforced there (§10).
+- **Provider-neutral:** `AgentBackend` stays provider-neutral; `OpenAICompatibleBackend` (Phase 7)
+  reuses the same box tools and host-side loop.
+- **§15's test is answered:** with the plain API the model has no tools except those declared, so
+  "reliably limited to factory tools" holds by construction.
+
+**Rejected variant: the Claude Agent SDK on the host with its built-in tools disabled.** It runs the
+Claude Code binary as the host user and by default loads the user's `~/.claude/` and the project's
+`.claude/` (skills, commands, memory, hooks, plugins). One misconfiguration, or a new built-in tool
+in an SDK update, would act on the host: it fails open. Do not run the Agent SDK on the host.
+
+**Costs accepted with A**
+
+- **The factory owns the agent loop** (system prompt per role, retries, budgets, context management),
+  but the SDK covers most of it: the tool runner (`client.beta.messages.tool_runner`, `@beta_tool`);
+  server-side compaction (beta `compact-2026-01-12`, edit `compact_20260112`, default trigger 150K
+  input tokens; append the full `response.content` so compaction blocks survive); context editing
+  (beta `context-management-2025-06-27`, `clear_tool_uses_20250919`); task budgets (beta
+  `task-budgets-2026-03-13`, `output_config.task_budget`, minimum 20,000 tokens, advisory pacing for
+  the model); prompt caching (`cache_control`; check `usage.cache_read_input_tokens` > 0);
+  `output_config.effort`; adaptive thinking.
+- **No Claude Code extras** (subagents, to-do lists, skills). Nice, but none is needed to implement a
+  ticket.
+- **Quality vs Claude Code's native harness:** expected to be small because the models are trained
+  on these two tools, but it is **measured in Phase 2, not assumed** (opt-in `live` tests on a few
+  fixture tasks).
+- **Shell state does not persist between commands:** each command runs in a fresh container on the
+  persistent `/work` volume, so files persist but the working directory, environment variables and
+  background processes do not. The system prompt says so (`restart` is a no-op); one long-lived
+  container per task is a later option if the measurements show a cost.
+- **Prompt injection:** text in a target repo or in test output can try to steer the model. Under A
+  it can only do what the box allows, and the gates, the protected oracle and the diff policy judge
+  the result (§5.5). B is no better here.
+
+**API facts for the Phase 2 spec** (checked against Anthropic's docs and SDK reference on 2026-11-11;
+re-verify against the live docs when implementing)
+
+- Models and tiers come from factory config (§12); set `output_config.effort` explicitly per role
+  (Opus 5.5 defaults to `medium`, Sonnet 5.5 to `high`).
+- Forced `tool_choice` (`any` / `tool`) returns 400 on Opus 5.5 and Sonnet 5.5: use `auto`, steer from
+  the prompt, and `strict: true` for schema-valid inputs. Thinking cannot be disabled on Opus 5.5
+  (effort is the control); `budget_tokens` is rejected on current models.
+- Check `stop_reason` before reading content: `tool_use`, `end_turn`, `max_tokens`, `pause_turn`,
+  `refusal` (`stop_details.category`; server-side `fallbacks`, beta `server-side-fallback-2026-07-01`).
+- Return all results of parallel tool calls in one user message; parse tool inputs as JSON and
+  validate them before executing anything.
+- Stream long requests (large `max_tokens`) and use `get_final_message()`. The SDK retries 408, 409,
+  429 and 5xx (default 2 retries); handle `RateLimitError` / `retry-after` as a halt (§10).
+- On API version `2026-10-21`, `temperature` / `top_p` / `top_k` are rejected: never send them.
+- Docs: bash tool, text editor tool, tool runner, compaction, prompt caching, task budgets (Sources).
+
+GitHub and deploy credentials exist only in the release stage, which is deterministic host code.
+They are never in a container and never in any LLM context.
 
 ### 5.4 Holdout execution is black-box
 
@@ -289,15 +379,18 @@ frame tool output as data.
 
 Scripted attacks, run from inside the box via `FakeBackend`. Each must fail. v1 (Phase 1b,
 `tests/redteam/`) covers the box: identity, visibility of host files/env/state/other workspaces,
-network, resource limits and the git escapes. The credential and egress items only apply to option B
-(§5.3) and land with it; the holdout redaction item lands with the probe containers in Phase 3.
+network, resource limits and the git escapes. Phase 2 adds the option-A items (§5.3): an API-key
+canary set in the factory process never appears in the box, and no model tool call executes on the
+host (undeclared tool names and malformed inputs are refused). The holdout redaction item lands with
+the probe containers in Phase 3.
 
 - read host files, host env vars, the host home directory
 - read or write another worker's volume
 - read factory state, SQLite or the holdout (via `python -c`, symlinks, `/proc`, mount tricks)
-- obtain a reusable provider credential (only a run-scoped broker token may be present)
+- obtain the provider API key (it exists only in the host process; no token of any kind is in the box)
 - obtain GitHub or deploy credentials
-- reach a non-allowlisted host (direct IP, DNS tricks, alternate ports)
+- reach any host or network (direct IP, DNS tricks, alternate ports; the box has no network)
+- make a model tool call act on the host (undeclared tools, malformed input, path escapes)
 - reach the Docker socket or escalate privileges
 - git escapes: a bundle with extra refs, a rewritten base, gitlinks, a symlink to an absolute path,
   an oversized blob, a malicious `.gitmodules`
@@ -449,8 +542,8 @@ oracle_version: sha256:…
  "waivers": [], "proposals": []}
 ```
 
-**Ledger (SQLite):** `tickets`, `tasks`, `runs` (role, backend, model, effort, broker-metered tokens
-and cost, duration, result subtype, session id, transcript path), `verdicts`, `evidence`, `events`
+**Ledger (SQLite):** `tickets`, `tasks`, `runs` (role, backend, model, effort, tokens and cost metered
+from API responses, duration, result subtype, session id, transcript path), `verdicts`, `evidence`, `events`
 (append-only), `halts`, `releases`.
 
 ---
@@ -487,11 +580,12 @@ available, release hold.
 - **Tiers** `fast` / `standard` / `frontier` (/ `apex`, off by default).
 - **Cheap-first, escalate on observed struggle** (§4.2). The orchestrator proposes; code disposes.
   Before committing to a cascade, measure the simpler alternative: the frontier model at lower effort.
-- **Budgets:** a per-ticket cap split across stages, enforced at the broker (authoritative); per-run
-  `max_turns`; SDK `max_budget_usd` as a secondary guard only (it's an estimate and can overshoot).
-- **Halts:** `RateLimitEvent.rate_limit_info.status == "rejected"` → `halted(rate_limit,
-  resets_at)`; a billing error → halt; budget exhausted at the broker → `halted(budget)`. The
-  scheduler resumes automatically.
+- **Budgets:** a per-ticket cap split across stages, enforced by the host-side model loop from each
+  response's `usage` (authoritative: the box never touches it); per-run `max_turns`; the API's task
+  budget (§5.3) only as an advisory pacing signal to the model.
+- **Halts:** a 429 that outlasts the SDK's retries (`RateLimitError`, `retry-after`) →
+  `halted(rate_limit, resets_at)`; a billing or authentication error → halt; budget exhausted →
+  `halted(budget)`. The scheduler resumes automatically.
 - **Concurrency:** 1 until the sequential factory meets the Phase 6 reliability bar.
 - **Metrics (`factory stats`):** cost per accepted ticket, rounds to converge, escalation rate,
   human-intervention rate, escaped-defect rate, holdout catch rate, waiver rate, rollback rate.
@@ -512,7 +606,7 @@ class AgentResult:
     halt: Halt | None                     # rate_limit(resets_at) | billing | budget | max_turns
     structured_output: dict | None        # validated against role.output_schema
     text: str | None
-    usage: Usage                          # from the broker (authoritative), plus backend-reported numbers
+    usage: Usage                          # metered by the factory from API responses (authoritative)
     session_id: str | None
     transcript_path: Path
     permission_denials: list[dict]
@@ -521,8 +615,8 @@ class AgentResult:
 | Backend | When | Notes |
 |---|---|---|
 | `FakeBackend` | Phase 1 | Scripted actions executed in the box through `ToolExecutor`; drives the vertical slice and the red-team suite without LLM spend. |
-| `ClaudeAgentSDKBackend` | Phase 2 | `output_format`, `effort`, hooks, `agents`, `setting_sources=[]`, `RateLimitEvent`. Placement per §5.3: A (host loop, tools through `ToolExecutor`) or B (in the box, through the broker). |
-| `OpenAICompatibleBackend` | Phase 7 | Llama/Qwen via Ollama or vLLM, behind the same broker; the factory supplies the tool loop itself. |
+| `ClaudeAPIBackend` | Phase 2 | Option A (§5.3): host-side loop on the `anthropic` SDK (Messages API, tool runner or own loop); Anthropic's `bash_20250124` and `text_editor_20250728` tools executed in the box through `ToolExecutor`; `output_config.effort`, adaptive thinking, compaction, prompt caching, structured role output; usage metered from responses. Not the Claude Agent SDK. |
+| `OpenAICompatibleBackend` | Phase 7 | Llama/Qwen via Ollama or vLLM, with the same host-side loop and box tools. |
 | `CodexBackend` / OpenAI Agents | Phase 7+ | Enables cross-family verification. |
 
 Nothing safety- or correctness-critical depends on a backend capability.
@@ -531,7 +625,7 @@ Nothing safety- or correctness-critical depends on a backend capability.
 
 ## 12. Configuration
 
-**Factory config** (`$LOCAL_FACTORY_HOME/config.toml`): backends, tiers, pricing, broker, sandbox.
+**Factory config** (`$LOCAL_FACTORY_HOME/config.toml`): backends, tiers, pricing, sandbox.
 
 ```toml
 [tiers.claude]
@@ -540,15 +634,17 @@ standard = "claude-sonnet-5-5"
 frontier = "claude-opus-5-5"
 apex     = "claude-fable-5-2"     # disabled unless enabled explicitly
 
-[pricing]                          # USD per 1M tokens; estimates only, the broker meters actuals
+[pricing]                          # USD per 1M tokens; the factory meters usage from API responses
 "claude-haiku-5-5"  = { input = 0.10, output = 0.50, long_context_over = 100_000, long_input = 0.50, long_output = 2.50 }
 "claude-sonnet-5-5" = { input = 2.00, output = 10.00 }
 "claude-opus-5-5"   = { input = 4.00, output = 20.00 }
 "claude-fable-5-2"  = { input = 8.00, output = 40.00 }
 
-[sandbox]
-worker_image = "local-factory/worker@sha256:…"
-egress_allowlist = ["broker.internal", "pypi.org", "files.pythonhosted.org"]
+[sandbox]                          # config.SandboxConfig; the box always has --network none
+image = "local-factory/sandbox:v1"
+memory_mb = 2048
+command_timeout_s = 300
+cache_mounts = [{ source = "/srv/cache/uv", target = "/cache/uv" }]   # read-only dependency caches
 ```
 
 **Target contract** (`factory.toml` in the target repo; protected):
@@ -606,15 +702,14 @@ local-factory/
 │   ├── oracle/                    test architect driver, holdout store, red-first, change control, redaction, burn/rotate
 │   ├── orchestration/             planner, DAG validation, scheduler, escalation, convergence loop
 │   ├── gitops/                    bare repo, bundle export/import + validation, integration, candidate squash
-│   ├── sandbox/                   container runner + hardening, egress proxy config, app/probe containers
-│   ├── broker/                    model broker: run-scoped tokens, metering, budget cut-off
+│   ├── sandbox/                   the box: specs + hardening, docker runtime, workspaces, lf-entry, SandboxExecutor; app/probe containers (Phase 3)
 │   ├── verification/              gate runner, verify-ticket, mutation/coverage/flake, waivers, min-aggregation
 │   ├── evidence/                  evidence bundle, hashing/HMAC, GitHub commit status
 │   ├── release/                   GitHub API (PR, merge with sha), release policy, migrations checks, deployers/, rollback
-│   ├── agents/                    backend.py, fake.py, claude_sdk.py, roles/*.md
+│   ├── agents/                    backend.py, tools.py (ToolExecutor), local.py, fake.py, claude_api.py, roles/*.md
 │   ├── policy/                    diff policy, role permissions, hook bridge
 │   └── memory/                    per-ticket log, lessons, ADR helpers
-├── docker/                        worker, app-runner, probe images
+├── docker/                        sandbox image (1b); app-runner, probe images (Phase 3)
 ├── templates/fastapi-web/         target scaffold
 ├── tests/{unit,integration,e2e,redteam}/ and tests/fixtures/cli-target/
 └── docs/PLAN.md
@@ -635,7 +730,7 @@ policy it imposes.
 | **0. Reset** | Tag `legacy-v0`; remove `factory/`, `greet.py`, `slugify.py` (greet/slugify → `tests/fixtures/`); uv skeleton; ruff + mypy + pytest; CI for this repo; README rewrite. | `uv run factory --help`; CI green |
 | **1a. Control plane** | models, ledger + state machine, config, `AgentBackend` + `FakeBackend`, bare repo + bundle export/import + validation, gate runner, diff policy, min-aggregation, evidence binding. | unit + integration tests green, including negative bundle tests |
 | **1b. Boundary — vertical slice** | the box: hardened, network-less containers for every worker action (`ToolExecutor`), worker git and export, gates (one fresh tree per gate); tmpfs task workspaces; the sandboxed slice; red-team suite v1. Spec: `docs/specs/phase-1b.md`. | **one ticket, one worker, one isolated container boundary, one commit, bundle import, one deterministic verification, one integration, evidence bound to the SHA (incl. the image digest)**, all with FakeBackend and $0 LLM spend; red-team suite v1: every check holds |
-| **2. Claude + Gate 1** | **agent placement decision (§5.3)**; `ClaudeAgentSDKBackend` (A: host loop + box tools; B: in the box + broker/proxy); intake roles; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests |
+| **2. Claude + Gate 1** | `ClaudeAPIBackend` (option A, §5.3: host-side loop on the `anthropic` SDK, Anthropic's bash + text-editor tools executed in the box) with the option-A red-team items and an opt-in `live` quality check; intake roles; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests; a real model completes a fixture task through the box with the API key never in the box |
 | **3. Gate 2, single lane** *(highest priority)* | orchestrator, sequential implementer tasks, `verify_fast` + Stop gate, verify-ticket, redaction + leak scan, burn/rotate, escalation + stop rules, quality reviewer. | on a fixed benchmark of ≥5 notes-app tickets: converge rate recorded, ≥1 ticket needs >1 round and converges, zero holdout literals in any feedback, red-team still green. This proves **convergence**, not just execution. |
 | **4. Verification depth** | diff-scoped mutation, changed-line coverage, waivers, flake/session/data measures, blind per-AC behavioral check, Hypothesis, security reviewer. Metrics introduced one at a time with baselines. | a planted vacuous test and a planted wrong-expectation test are both caught; waiver flow audited end to end |
 | **5. Gate 3** | candidate squash + verify-ticket@SHA, commit statuses + branch protection, sha-pinned merge + tree-hash check, release policy (R2 hold, always-hold), migration linter + compatibility check + backup, canary + monitoring + auto-rollback, `factory pause`. **Needs the deploy-target decision.** | R1 ticket: prompt → prod with no human action after approval; R2 ticket holds; moving `main` during release forces re-verification (a stale pass is rejected); destructive migration is held; a broken deploy rolls back automatically |
@@ -650,8 +745,10 @@ the candidate SHA, with worker git and gates still on the host. Phase 1b is comp
 `docs/specs/phase-1b.md`): the same slice runs behind the box (`pipeline/sandboxed_slice.py`), with
 every worker action, the worker's git, the export and every gate in network-less containers, the
 evidence bound to the sandbox image digest, and red-team suite v1 green; 2081 tests, 100% branch
-coverage on Python 3.12 and 3.14. App/probe containers moved to Phase 3 and the broker/proxy to
-option B (§5.3). **Next: Phase 2**, starting with the agent-placement decision (§15).
+coverage on Python 3.12 and 3.14 (commit `04bc423`, CI green). App/probe containers moved to Phase 3.
+Agent placement was decided the same day: **option A** (§5.3); the broker and egress proxy are
+dropped. **Next: Phase 2**: write `docs/specs/phase-2.md` and its protected acceptance tests from
+§5.3 and this table's Phase 2 row (plus its §14.1 rows), then the agent team builds it.
 
 ### 14.1 Carried forward from the Phase 1a review
 
@@ -669,7 +766,7 @@ cover them.
 | 1b | Fresh per-gate `HOME` means cold tool caches (uv, pip, npm) | Mount read-only shared caches into gate containers explicitly |
 | 1b | Host code could follow a worker-produced symlink | Worker trees never land on the host: the box exports bundles, and gates and the verifier materialize trees inside the box |
 | 1b | Candidate-conflict paths are recorded only as transition text | Add structured `data` to `Ledger.transition` (as `update_task` already has) |
-| 2 | How a model-driven agent reaches its model (A: host loop + box tools; B: in-box agent + broker + egress proxy) | Decide while building `ClaudeAgentSDKBackend` (§5.3); B brings the broker, proxy and their red-team items |
+| 2 | How a model-driven agent reaches its model | **Decided 2026-11-11: option A** (§5.3). Build `ClaudeAPIBackend`: host-side loop, box tools through `ToolExecutor`, no broker or proxy; add the option-A red-team items (§5.6) |
 | 3 | Black-box holdout probes need app + probe containers (§5.4), and the redaction red-team item | Build them with the holdout store and verify-ticket |
 | 2 | Unsafe symlinks already in a target's base fail every task closed (`symlink_escape`) | `factory project add` detects and reports them when a repo is adopted |
 | 2 | `DiffPolicy.test_globs` are Python-only and not configurable | `[paths] test_globs` in `factory.toml` (needed for the notes-app JS/TS code) |
@@ -682,8 +779,8 @@ cover them.
 
 | Decision | Needed before | Recommendation |
 |---|---|---|
-| Billing mode (API key vs Claude subscription) | Phase 1b (broker design) | **Decided (2026-11-10): API key.** A broker is only needed under agent placement B. (Subscription would have meant a short-lived in-container token + provider-only egress, documented as an accepted risk.) |
-| Agent placement (§5.3) | Phase 2 | **Open (2026-11-11).** A = model loop on the host, tools through `ToolExecutor` into a network-less box (no broker); B = agent in the box behind a broker + egress proxy. Decide on evidence from the Claude backend: can it be reliably limited to factory tools, and what do simpler tools cost in quality. 1b builds what both need. |
+| Billing mode (API key vs Claude subscription) | Phase 1b (broker design) | **Decided (2026-11-10): API key.** With option A the key stays in the host process and no broker is needed. Anthropic does not allow third-party products to offer claude.ai login unless approved, so a subscription is not an option for users of this project either (§5.3). |
+| Agent placement (§5.3) | Phase 2 | **Decided (2026-11-11): option A**, brain on the host, hands in the box. Model loop in the factory process on the `anthropic` SDK; Anthropic's bash + text-editor tools execute in the network-less box through `ToolExecutor`; no broker, no egress proxy; the Claude Agent SDK is not used on the host. Reasons, rejected variant, accepted costs and API facts: §5.3. Option B (agent in the box behind a broker + egress proxy) is rejected; reopen only on new evidence, e.g. the Phase 2 quality measurement showing a large gap. |
 | Deploy target for the notes app | Phase 5 | Docker on Fly.io (releases make rollback simple; canary by machine); alternative: a VPS with docker compose + Caddy. |
 | R2 promotion thresholds | Phase 5 | Start at 10 clean releases / 14-day escaped-defect window; revisit with data. |
 | Evidence signing key | Phase 1a | **Done in 1a:** a local key file in `$LOCAL_FACTORY_HOME` (0600, created if missing, never silently replaced); rotate on demand. Enforcement relies on commit statuses, not on the key. |
@@ -706,4 +803,5 @@ cover them.
 - Sandboxing — [Worktree/symlink escape fixes](https://www.digitalapplied.com/blog/agent-sandbox-escapes-worktree-symlink-command-filters-2026), [Egress allowlists](https://startdebugging.net/2026/07/how-to-lock-down-a-coding-agents-network-egress-with-a-strict-host-allowlist/)
 - Git — [git-worktree](https://git-scm.com/docs/git-worktree), [git-bundle](https://git-scm.com/docs/git-bundle)
 - Migrations — [Parallel change (expand/contract)](https://martinfowler.com/bliki/ParallelChange.html)
-- Claude Agent SDK — [Python reference](https://code.claude.com/docs/en/agent-sdk/python); pricing — [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+- Claude API (option A, §5.3) — [Bash tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/bash-tool), [Text editor tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool), [Tool runner](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-runner), [Compaction](https://platform.claude.com/docs/en/build-with-claude/compaction), [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), [Task budgets](https://platform.claude.com/docs/en/build-with-claude/task-budgets); pricing — [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+- Claude Agent SDK (rejected for the host, §5.3) — [Overview: login rule, license and terms](https://code.claude.com/docs/en/agent-sdk/overview), [Python reference](https://code.claude.com/docs/en/agent-sdk/python)

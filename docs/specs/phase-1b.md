@@ -403,7 +403,7 @@ Every check must hold. Written by the orchestrator before implementation:
 
 | To | What |
 |---|---|
-| Phase 2 | **Agent placement** decision (PLAN §15): A = host loop + `ToolExecutor` (no network in the box, no broker) vs B = agent in the box + model broker + egress proxy. Decide while building `ClaudeAgentSDKBackend`. |
+| Phase 2 | **Agent placement** (PLAN §15): **decided 2026-11-11, option A** = host loop + `ToolExecutor` (no network in the box, no broker); B was rejected. Phase 2 builds `ClaudeAPIBackend` (PLAN §5.3). |
 | Phase 2 | Read-only dependency caches (`cache_mounts`, `gate_env`) exercised by the notes-app template; adding a dependency to a target is a human-approved image/cache change, never something an agent can do from the box. |
 | Phase 3 | App + probe containers for black-box holdout probes (PLAN §5.4), the holdout-literal redaction check, and their red-team items. |
-| Option B only | Broker, egress proxy, and the credential/egress red-team items (PLAN §5.3, §5.6). |
+| ~~Option B only~~ | Broker, egress proxy and their red-team items: dropped with option B (2026-11-11). Phase 2 adds the option-A red-team items instead (PLAN §5.6). |

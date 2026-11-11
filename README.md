@@ -13,9 +13,10 @@ the exact commit that ships.
             └──────────── verification spine: every gate has a hard exit check ────────────┘
 ```
 
-**Status:** v1 rewrite — Phases 0 and 1a (control plane + host vertical slice) complete; next is
-Phase 1b (hardened containers, egress proxy, model broker, red-team suite). Nothing here drives a
-real model yet.
+**Status:** v1 rewrite — Phases 0, 1a (control plane + host vertical slice) and 1b (every worker
+action in a hardened, network-less container; red-team suite) complete. Next is Phase 2: a Claude
+backend whose model loop runs on the host while every tool call it makes runs in the box, so the
+API key never enters a container. Nothing here drives a real model yet.
 The design, its rationale and the phase plan live in [`docs/PLAN.md`](docs/PLAN.md); the v0 bash
 loop is preserved at the `legacy-v0` tag.
 
