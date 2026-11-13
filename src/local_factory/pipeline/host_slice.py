@@ -36,6 +36,7 @@ from local_factory.pipeline.flow import (
     IMPLEMENTER_ROLE,
     VERIFIER_ROLE,
     Refused,
+    Site,
     SliceError,
     SliceOutcome,
     SliceStatus,
@@ -56,6 +57,7 @@ __all__ = [
     "SliceOutcome",
     "SliceStatus",
     "VerifierReport",
+    "host_site",
     "reconcile_criteria",
     "run_host_slice",
 ]
@@ -106,6 +108,14 @@ async def run_host_slice(
 
 
 # --------------------------------------------------------------------------- the host site
+
+
+def host_site() -> Site:
+    """The host site: workers and verification trees are plain directories under the work root.
+
+    **Not a security boundary** (see :func:`run_host_slice`): for in-process tests and development.
+    """
+    return _HostSite()
 
 
 class _HostSite:

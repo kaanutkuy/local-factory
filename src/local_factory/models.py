@@ -17,6 +17,11 @@ SHA_PATTERN = r"^[0-9a-f]{40}([0-9a-f]{24})?$"
 HASH_TAG_PATTERN = r"^sha256:[0-9a-f]{64}$"
 TICKET_ID_PATTERN = r"^T-[0-9]{4,}$"
 TASK_ID_PATTERN = r"^T-[0-9]{4,}/task-[0-9]+$"
+CRITERION_ID_PATTERN = r"^AC-[0-9]+$"
+QUESTION_ID_PATTERN = r"^Q-[0-9]+$"
+PROBE_ID_PATTERN = r"^HP-[0-9]+$"
+# A visible acceptance test: "<path>::<name>" (pytest-style; the name may contain "::" or ".")
+TEST_ID_PATTERN = r"^[^:\s][^:]*::\S.*$"
 
 
 class FrozenModel(BaseModel):
@@ -73,10 +78,23 @@ class TestLayer(StrEnum):
     E2E = "e2e"
 
 
+class CriterionKind(StrEnum):
+    """What a criterion asks of the code (docs/specs/phase-2b.md).
+
+    A ``change`` is behaviour the code does not have yet: its tests and probes must fail on the
+    base. A ``keep`` is behaviour the code has today and must not lose: its tests and probes must
+    pass on the base, and they guard against breaking it.
+    """
+
+    CHANGE = "change"
+    KEEP = "keep"
+
+
 class Criterion(FrozenModel):
-    id: str = Field(pattern=r"^AC-[0-9]+$")
+    id: str = Field(pattern=CRITERION_ID_PATTERN)
     ears: str = Field(min_length=1)
     layer: TestLayer
+    kind: CriterionKind = CriterionKind.CHANGE
     tests: tuple[str, ...] = ()
     holdout_probes: int = Field(default=0, ge=0)
 
@@ -96,6 +114,174 @@ class Contract(FrozenModel):
         if len(ids) != len(set(ids)):
             raise ValueError(f"duplicate criterion ids: {sorted(ids)}")
         return self
+
+
+# --------------------------------------------------------------------------- Gate 1 (intake)
+# The intake roles' outputs (docs/specs/phase-2b.md). Each `*Draft`/role output is what a model
+# submits; the factory numbers it (AC-n, Q-n, HP-n) and stores the result.
+
+
+class TicketSize(StrEnum):
+    S = "S"
+    M = "M"
+    L = "L"
+    XL = "XL"  # an epic: too large for one ticket
+
+
+class TriageResult(FrozenModel):
+    """The triage role's output."""
+
+    title: str = Field(min_length=1, max_length=80)
+    type: TicketType
+    risk: RiskTier
+    size: TicketSize
+    areas: tuple[str, ...] = Field(default=(), max_length=20)
+    duplicate_of: str | None = Field(default=None, pattern=TICKET_ID_PATTERN)
+    rationale: str = Field(min_length=1, max_length=2000)
+
+
+class CriterionDraft(FrozenModel):
+    ears: str = Field(min_length=1, max_length=1000)
+    layer: TestLayer
+    test_plan: str = Field(min_length=1, max_length=1000)
+    kind: CriterionKind = CriterionKind.CHANGE
+
+
+class SpecDraft(FrozenModel):
+    """The spec writer's output; the factory numbers the criteria AC-1..AC-n in order."""
+
+    summary: str = Field(min_length=1, max_length=2000)
+    criteria: tuple[CriterionDraft, ...] = Field(min_length=1, max_length=20)
+    nfr: tuple[str, ...] = Field(default=(), max_length=20)
+    out_of_scope: tuple[str, ...] = Field(default=(), max_length=20)
+    assumptions: tuple[str, ...] = Field(default=(), max_length=20)
+    migration_impact: MigrationImpact = MigrationImpact.NONE
+
+    @model_validator(mode="after")
+    def _changes_something(self) -> Self:
+        if all(c.kind is CriterionKind.KEEP for c in self.criteria):
+            raise ValueError("a spec needs at least one change criterion")
+        return self
+
+
+class QuestionDraft(FrozenModel):
+    text: str = Field(min_length=1, max_length=1000)
+    why_blocking: str = Field(min_length=1, max_length=1000)
+
+
+class Critique(FrozenModel):
+    """The ambiguity critic's output: blocking questions and recorded (non-blocking) guesses."""
+
+    blocking: tuple[QuestionDraft, ...] = Field(default=(), max_length=5)
+    assumptions: tuple[str, ...] = Field(default=(), max_length=20)
+
+
+class Question(FrozenModel):
+    """A stored question. `round` is the clarify round of a critic's question, 0 for one the
+    factory asks itself (a suspected duplicate, an epic)."""
+
+    id: str = Field(pattern=QUESTION_ID_PATTERN)
+    text: str = Field(min_length=1)
+    why_blocking: str = ""
+    asked_by: str = Field(min_length=1)
+    round: int = Field(ge=0)
+    answer: str | None = None
+    answered_by: str | None = None
+
+
+def _no_nul(values: tuple[str, ...] | str, what: str) -> None:
+    for value in (values,) if isinstance(values, str) else values:
+        if "\0" in value:
+            raise ValueError(f"{what} must not contain NUL characters")
+
+
+class ProbeExpectation(FrozenModel):
+    """What a black-box probe expects. Output is compared with trailing newlines removed from
+    both sides; at least one expectation must be given."""
+
+    exit_code: int | None = Field(default=None, ge=0, le=255)
+    stdout: str | None = Field(default=None, max_length=4000)
+    stdout_contains: tuple[str, ...] = Field(default=(), max_length=10)
+
+    @model_validator(mode="after")
+    def _something_expected(self) -> Self:
+        if self.exit_code is None and self.stdout is None and not self.stdout_contains:
+            raise ValueError("a probe must expect an exit code, a stdout, or stdout fragments")
+        if any(not fragment for fragment in self.stdout_contains):
+            raise ValueError("stdout_contains fragments must not be empty")
+        return self
+
+
+class ProbeDraft(FrozenModel):
+    """A black-box CLI probe: `argv` runs (no shell) at the repository root of the app under
+    test, with `stdin` as its standard input; the factory compares the result itself."""
+
+    criteria: tuple[str, ...] = Field(min_length=1, max_length=20)
+    argv: tuple[str, ...] = Field(min_length=1, max_length=50)
+    stdin: str = Field(default="", max_length=10_000)
+    expect: ProbeExpectation
+
+    @model_validator(mode="after")
+    def _well_formed(self) -> Self:
+        _no_nul(self.argv, "argv")
+        _no_nul(self.stdin, "stdin")
+        if any(not arg or len(arg) > 1000 for arg in self.argv):
+            raise ValueError("each argv item must be 1..1000 characters")
+        return self
+
+
+class HoldoutProbe(ProbeDraft):
+    id: str = Field(pattern=PROBE_ID_PATTERN)
+
+
+class VisibleTest(FrozenModel):
+    test: str = Field(pattern=TEST_ID_PATTERN, max_length=500)
+    criteria: tuple[str, ...] = Field(min_length=1, max_length=20)
+
+
+class OracleManifest(FrozenModel):
+    """The test architect's output. The visible tests are files it wrote; the probes exist only
+    here and, once accepted, in the holdout store."""
+
+    visible: tuple[VisibleTest, ...] = Field(min_length=1, max_length=50)
+    holdout: tuple[ProbeDraft, ...] = Field(min_length=1, max_length=30)
+    notes: str = Field(default="", max_length=4000)
+
+
+class RedCheck(FrozenModel):
+    """One red-first result. `reason` never contains a probe's expectation.
+
+    `red`: it ran and failed on the base. `green`: it ran and passed on the base. Neither: it did
+    not run cleanly (no test ran, an error, a timeout). `keep`: it checks keep criteria, so it
+    must be green; every other check must be red (`ok`).
+    """
+
+    kind: Literal["visible", "holdout"]
+    id: str = Field(min_length=1)  # the visible test id, or the probe id
+    red: bool
+    green: bool = False
+    keep: bool = False
+    reason: str = Field(min_length=1)
+    output: str = ""  # a bounded tail of what it printed on the base
+
+    @model_validator(mode="after")
+    def _not_red_and_green(self) -> Self:
+        if self.red and self.green:
+            raise ValueError("a check cannot be both red and green")
+        return self
+
+    @property
+    def ok(self) -> bool:
+        """Green for a keep check, red for any other."""
+        return self.green if self.keep else self.red
+
+
+class Holdout(FrozenModel):
+    """A ticket's sealed holdout record (the holdout store; never in a repository or a box)."""
+
+    ticket_id: str = Field(pattern=TICKET_ID_PATTERN)
+    oracle_sha: str = Field(pattern=SHA_PATTERN)
+    probes: tuple[HoldoutProbe, ...] = Field(min_length=1)
 
 
 class Ticket(FrozenModel):

@@ -1,14 +1,15 @@
 """Live: a real Claude model completes fixture tasks through the box (docs/specs/phase-2a.md §
 Exit check; PLAN §5.3 "quality ... is measured in Phase 2, not assumed"). Protected.
 
-Opt-in only: `uv run pytest -m live tests/live` (deselected by default). Spends real tokens (a few
-US dollars at most; each run is capped by `max_run_cost_usd`) and needs `ANTHROPIC_API_KEY`,
-Docker and the sandbox image. Without a key it fails; it never skips.
+Opt-in only: `uv run pytest -m live tests/live` (deselected by default). Spends real tokens
+(cents: every tier maps to Claude Haiku 5.5, see LIVE_TIERS, and each run is capped by
+`max_run_cost_usd`) and needs `ANTHROPIC_API_KEY`, Docker and the sandbox image. Without a key it
+fails; it never skips.
 
-Each task runs the whole sandboxed slice: Sonnet (standard tier) implements, Opus (frontier)
-verifies, the target's gates judge, and then a hidden check the model never saw runs on the
-candidate in a fresh box. One JSON line per task goes to `$LF_LIVE_REPORT` when set (always to
-stdout): outcome, hidden check, and per run the model, turns, tokens, cache reads and cost.
+Each task runs the whole sandboxed slice: the implementer and the verifier, the target's gates
+judge, and then a hidden check the model never saw runs on the candidate in a fresh box. One JSON
+line per task goes to `$LF_LIVE_REPORT` when set (always to stdout): outcome, hidden check, and
+per run the model, turns, tokens, cache reads and cost.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from local_factory.models import (
     TestLayer,
     TicketStatus,
     TicketType,
+    Tier,
 )
 from local_factory.pipeline.sandboxed_slice import run_sandboxed_slice
 from local_factory.sandbox import Sandbox
@@ -48,8 +50,10 @@ pytestmark = [pytest.mark.live, pytest.mark.container, pytest.mark.integration]
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "cli-target"
 ORACLE = "sha256:" + "c" * 64
-MAX_RUN_COST_USD = 2.0
-MAX_TASK_COST_USD = 5.0
+MAX_RUN_COST_USD = 0.50
+MAX_TASK_COST_USD = 1.00
+LIVE_MODEL = "claude-haiku-5-5"
+LIVE_TIERS = {"claude": dict.fromkeys(Tier, LIVE_MODEL)}
 
 
 @dataclass(frozen=True)
@@ -141,7 +145,10 @@ def test_a_real_model_completes_a_fixture_task(
         criteria=(Criterion(id="AC-1", ears=task.criterion, layer=TestLayer.E2E),),
     )
     config = FactoryConfig(
-        home=tmp_path / "home", claude=ClaudeConfig(max_run_cost_usd=MAX_RUN_COST_USD)
+        home=tmp_path / "home",
+        tiers=LIVE_TIERS,
+        apex_enabled=True,  # every tier is Haiku here; nothing reaches the apex model
+        claude=ClaudeConfig(max_run_cost_usd=MAX_RUN_COST_USD),
     )
     sandbox = Sandbox(runtime, small_sandbox_config(run_timeout_s=1_200.0, memory_mb=512))
     backend = ClaudeAPIBackend(config, transcript_dir=tmp_path / "transcripts")
@@ -214,4 +221,5 @@ def test_a_real_model_completes_a_fixture_task(
     assert outcome.status == "candidate_verified", outcome
     assert hidden is not None and hidden.status is GateStatus.PASS, hidden
     assert cost < MAX_TASK_COST_USD
+    assert {r.model for r in runs} == {LIVE_MODEL}
     assert sum(r.usage.cache_read_tokens for r in runs) > 0  # prompt caching works

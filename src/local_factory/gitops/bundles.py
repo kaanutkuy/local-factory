@@ -257,22 +257,38 @@ def _symlinks(repo: BareRepo, rev: str) -> dict[str, str | None]:
     }
 
 
+def unsafe_symlinks(repo: BareRepo, rev: str) -> list[tuple[str, str]]:
+    """Every symlink in ``rev``'s tree that the import check rejects, as ``(path, reason)``.
+
+    Sorted by path. The reason names the link's target and why it is unsafe (``"/etc/passwd:
+    absolute target"``), so ``f"{path} -> {reason}"`` reads as the import check's own message.
+    Every symlink in the tree, changed or not, is resolved against every symlink in the tree (see
+    :func:`._paths.symlink_escape_reason`).
+    """
+    links = _symlinks(repo, rev)
+    found: list[tuple[str, str]] = []
+    for link in sorted(links):
+        reason = symlink_escape_reason(link, links)
+        if reason is not None:
+            target = links[link]
+            shown = "?" if target is None else display(target)
+            found.append((display(link), f"{shown}: {reason}"))
+    return found
+
+
 def _check_symlinks(repo: BareRepo, head: str) -> None:
     """The authoritative symlink check: every symlink in the head tree, changed or not, is
-    resolved against every symlink in the head tree (see :func:`._paths.symlink_escape_reason`).
+    resolved against every symlink in the head tree (see :func:`unsafe_symlinks`).
 
     Unchanged symlinks are checked too, because other changes can make them unsafe (``a -> .``
     replacing a directory ``a`` under an existing ``b -> a/..``). There is deliberately no
     exemption for unsafe symlinks that already exist in the base: whether such a link escapes
     physically depends on the rest of the tree, which the worker controls.
     """
-    links = _symlinks(repo, head)
-    for link in sorted(links):
-        reason = symlink_escape_reason(link, links)
-        if reason is not None:
-            target = links[link]
-            shown = "?" if target is None else display(target)
-            raise BundleRejected("symlink_escape", f"{display(link)} -> {shown}: {reason}")
+    unsafe = unsafe_symlinks(repo, head)
+    if unsafe:
+        path, reason = unsafe[0]
+        raise BundleRejected("symlink_escape", f"{path} -> {reason}")
 
 
 def _check_sizes(

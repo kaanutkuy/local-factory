@@ -62,10 +62,19 @@ class ReleaseConfig(FrozenModel):
         return {**_default_release_policy(), **value}
 
 
+# Paths the diff policy treats as tests (deleting one is a violation): `[paths] test_globs`.
+DEFAULT_TEST_GLOBS: tuple[str, ...] = ("tests/**", "**/test_*.py", "**/*_test.py")
+
+# The `[commands]` key Gate 1 runs one visible acceptance test with; `{path}` and `{name}` are
+# replaced by the test id's parts, shell-quoted (docs/specs/phase-2b.md, Red-first).
+ACCEPTANCE_COMMAND = "acceptance"
+
+
 class ProjectConfig(FrozenModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     commands: dict[str, str] = Field(default_factory=dict)
     protected: tuple[str, ...] = (PROJECT_CONFIG_FILENAME,)
+    test_globs: tuple[str, ...] = Field(default=DEFAULT_TEST_GLOBS, min_length=1)
     policy: PolicyConfig = PolicyConfig()
     release: ReleaseConfig = ReleaseConfig()
 
@@ -77,7 +86,7 @@ class ProjectConfig(FrozenModel):
 
 _PROJECT_SECTIONS = frozenset({"project", "commands", "paths", "policy", "release"})
 _PROJECT_KEYS = frozenset({"name"})
-_PATHS_KEYS = frozenset({"protected"})
+_PATHS_KEYS = frozenset({"protected", "test_globs"})
 _FACTORY_KEYS = frozenset({"tiers", "pricing", "apex_enabled", "sandbox", "claude"})
 _CLAUDE_KEYS = frozenset(
     {
@@ -236,8 +245,9 @@ def parse_project_config(
         "policy": raw.get("policy", {}),
         "release": raw.get("release", {}),
     }
-    if "protected" in paths:
-        data["protected"] = paths["protected"]  # pydantic rejects a bare string
+    for key in ("protected", "test_globs"):
+        if key in paths:
+            data[key] = paths[key]  # pydantic rejects a bare string
     try:
         return ProjectConfig.model_validate(data)
     except ValidationError as exc:

@@ -1,6 +1,9 @@
 # local-factory v1 — design and implementation plan
 
-Status: **proposal v1.4**, 2026-11-13 (v1.4: Phase 2 split into 2a, the `ClaudeAPIBackend`, and
+Status: **proposal v1.6**, 2026-11-14 (v1.6: Phase 2b done and passed live; every criterion is a
+**change** or a **keep**, and red-first expects keep checks green; v1.5: Phase 2a done and measured live; 2b holdout probes
+are black-box CLI probes stored as data, the notes-app template moves to Phase 3, spec
+`docs/specs/phase-2b.md`; v1.4: Phase 2 split into 2a, the `ClaudeAPIBackend`, and
 2b, Gate 1; spec `docs/specs/phase-2a.md`; v1.3: agent placement decided, **option A**: the model
 loop runs on the host and its tools execute in the box, see §5.3; v1.2: the Phase 1b box has no
 network). Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
@@ -56,6 +59,9 @@ review; open decisions are listed in §15.
 | Phase 2 | one phase | (v1.4) **2a** `ClaudeAPIBackend` + option-A red-team + opt-in `live` check; **2b** Gate 1 (§14). |
 | Role output | "structured output or a strict tool, decided in the Phase 2 spec" | (v1.4) a factory tool `submit_result` with `strict: true` (§5.3). |
 | Halts | rate limit, billing, budget, max turns | (v1.4) + `auth` (no usable key) and `unavailable` (overload/5xx/connection after the SDK's retries) (§10). |
+| Holdout in 2b | black-box probes, app + probe containers | (v1.5) 2b: **CLI probes as data** (argv, stdin, expected exit code/stdout), run in a fresh box with the app's tree only and compared on the host; the expectation never enters a box, a repo or the ledger. HTTP probes in app + probe containers stay in Phase 3 (§5.4). |
+| Notes-app template | Phase 2 | (v1.5) Phase 3: it needs an offline dependency story for the network-less box (FastAPI, Alembic, Playwright + Chromium). 2b proves Gate 1 on `tests/fixtures/cli-target`. |
+| Red-first | every new test and probe fails on the base | (v1.6) each criterion is a **change** (its tests and probes must fail on the base) or a **keep** (behaviour the code has today and must not lose: its checks must pass on the base). The first live run showed that a request saying what must not change was otherwise impossible to contract. A spec needs at least one change criterion; a test or probe checks one kind only. |
 
 ---
 
@@ -153,7 +159,7 @@ greet/slugify survive as a **fixture target repo** for the factory's own tests.
 | 4. Specify | Spec writer | contract: ACs in EARS form, NFRs, out-of-scope, assumptions, test plan per AC, **migration impact** | every AC testable |
 | 5. Clarify | Ambiguity critic (fresh) | blocking questions (only if a wrong guess would produce a rejected result) + recorded assumptions | none blocking, else `needs_info` |
 | 6. Build oracle | Test Architect (fresh) | visible acceptance tests → `tests/acceptance/T-xxxx/`; **black-box** holdout probes → factory state; traceability AC↔tests | every AC ≥1 visible + ≥1 holdout |
-| 7. Red-first | deterministic | run new tests/probes on base commit | 100% red; passing ones are vacuous or redundant → back to 6 |
+| 7. Red-first | deterministic | run new tests/probes on base commit | change checks 100% red, keep checks 100% green; anything else (a vacuous test, a broken one) → back to 6 |
 | 8. Approve | **Human** | `factory approve T-7` → contract frozen (hash in ledger); oracle version recorded | `ready` |
 
 ### 4.2 Gate 2 — Orchestrate & Build (convergence loop)
@@ -338,7 +344,11 @@ in an SDK update, would act on the host: it fails open. Do not run the Agent SDK
   ticket.
 - **Quality vs Claude Code's native harness:** expected to be small because the models are trained
   on these two tools, but it is **measured in Phase 2, not assumed** (opt-in `live` tests on a few
-  fixture tasks).
+  fixture tasks). First measurement (2026-11-13, Sonnet 5.5 implementer, Opus 5.5 verifier): 2 of 2
+  fixture tasks reached `candidate_verified` and passed a hidden check the model never saw, in 4
+  implementer turns and 5 verifier turns each, for $0.41 in total; prompt caching held (10–12
+  uncached input tokens per run against 8k–32k read from the cache). Live checks now map every
+  tier to Haiku 5.5 to fit the owner's API budget.
 - **Shell state does not persist between commands:** each command runs in a fresh container on the
   persistent `/work` volume, so files persist but the working directory, environment variables and
   background processes do not. The system prompt says so (`restart` is a no-op); one long-lived
@@ -455,7 +465,7 @@ Fresh context is not independent judgment. Concretely:
 | Check | Where | Kind | Default (tunable per project) |
 |---|---|---|---|
 | Contract completeness + traceability | G1 | det + LLM | every AC ↔ ≥1 test |
-| Red-first (acceptance, holdout, bug repro) | G1 | det | 100% red on base |
+| Red-first (acceptance, holdout, bug repro) | G1 | det | change checks red, keep checks green on base |
 | Lint / format / typecheck | G2, CI | det | 0 errors |
 | Unit tests for every changed unit with logic | G2, CI | det + reviewer | all pass |
 | Changed-line coverage (branch on) | G2, CI | det | ≥ 90% |
@@ -756,8 +766,8 @@ policy it imposes.
 | **1a. Control plane** | models, ledger + state machine, config, `AgentBackend` + `FakeBackend`, bare repo + bundle export/import + validation, gate runner, diff policy, min-aggregation, evidence binding. | unit + integration tests green, including negative bundle tests |
 | **1b. Boundary — vertical slice** | the box: hardened, network-less containers for every worker action (`ToolExecutor`), worker git and export, gates (one fresh tree per gate); tmpfs task workspaces; the sandboxed slice; red-team suite v1. Spec: `docs/specs/phase-1b.md`. | **one ticket, one worker, one isolated container boundary, one commit, bundle import, one deterministic verification, one integration, evidence bound to the SHA (incl. the image digest)**, all with FakeBackend and $0 LLM spend; red-team suite v1: every check holds |
 | **2a. Claude backend** | `ClaudeAPIBackend` (option A, §5.3: host-side loop on the `anthropic` SDK, Anthropic's bash + text-editor tools executed in the box through `ToolExecutor`) with the option-A red-team items and an opt-in `live` quality check. Spec: `docs/specs/phase-2a.md`. | the sandboxed slice reaches `candidate_verified` driven by `ClaudeAPIBackend` against an in-process fake API ($0); option-A red-team green (the key never in the box, no tool call acts on the host); opt-in: a real model completes fixture tasks through the box, judged by a hidden check |
-| **2b. Gate 1** | intake roles (triage, spec writer, ambiguity critic, test architect) on `ClaudeAPIBackend`; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template; the §14.1 rows below marked 2b. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests |
-| **3. Gate 2, single lane** *(highest priority)* | orchestrator, sequential implementer tasks, `verify_fast` + Stop gate, verify-ticket, redaction + leak scan, burn/rotate, escalation + stop rules, quality reviewer. | on a fixed benchmark of ≥5 notes-app tickets: converge rate recorded, ≥1 ticket needs >1 round and converges, zero holdout literals in any feedback, red-team still green. This proves **convergence**, not just execution. |
+| **2b. Gate 1** | intake roles (triage, spec writer, ambiguity critic, test architect) on `ClaudeAPIBackend`; holdout store with black-box **CLI** probes; red-first; CLI project add/intake/questions/answer/show/approve; the §14.1 rows below marked 2b. Spec: `docs/specs/phase-2b.md`. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests; holdout red-team green; opt-in: a real model (Haiku 5.5) does it on the fixture |
+| **3. Gate 2, single lane** *(highest priority)* | notes-app template (offline dependencies for the box); orchestrator, sequential implementer tasks, `verify_fast` + Stop gate, verify-ticket, redaction + leak scan, burn/rotate, escalation + stop rules, quality reviewer. | on a fixed benchmark of ≥5 notes-app tickets: converge rate recorded, ≥1 ticket needs >1 round and converges, zero holdout literals in any feedback, red-team still green. This proves **convergence**, not just execution. |
 | **4. Verification depth** | diff-scoped mutation, changed-line coverage, waivers, flake/session/data measures, blind per-AC behavioral check, Hypothesis, security reviewer. Metrics introduced one at a time with baselines. | a planted vacuous test and a planted wrong-expectation test are both caught; waiver flow audited end to end |
 | **5. Gate 3** | candidate squash + verify-ticket@SHA, commit statuses + branch protection, sha-pinned merge + tree-hash check, release policy (R2 hold, always-hold), migration linter + compatibility check + backup, canary + monitoring + auto-rollback, `factory pause`. **Needs the deploy-target decision.** | R1 ticket: prompt → prod with no human action after approval; R2 ticket holds; moving `main` during release forces re-verification (a stale pass is rejected); destructive migration is held; a broken deploy rolls back automatically |
 | **6. Parallelism** | parallel tasks/tickets, concurrency limits, data-driven escalation tuning, `factory stats`. **Entry bar:** benchmark converge rate and zero isolation incidents sustained over Phases 3–5. | two independent tickets in parallel merge cleanly; cost per accepted ticket reported |
@@ -773,8 +783,16 @@ every worker action, the worker's git, the export and every gate in network-less
 evidence bound to the sandbox image digest, and red-team suite v1 green; 2081 tests, 100% branch
 coverage on Python 3.12 and 3.14 (commit `04bc423`, CI green). App/probe containers moved to Phase 3.
 Agent placement was decided the same day: **option A** (§5.3); the broker and egress proxy are
-dropped. **Phase 2a** (2026-11-13): spec `docs/specs/phase-2a.md` and its protected acceptance
-tests are written; the agent team builds `ClaudeAPIBackend`. Next: Phase 2b (Gate 1).
+dropped. **Phase 2a** is complete (2026-11-13, commit `c776a8f`, CI green): `ClaudeAPIBackend`
+drives the sandboxed slice against an in-process fake API, the option-A red-team items hold, and
+the opt-in live check passed on the real API (§5.3). **Phase 2b** (Gate 1, spec
+`docs/specs/phase-2b.md`) is complete: intake roles, the sealed holdout store with black-box CLI
+probes, red-first with change and keep criteria, `factory project add/intake/questions/answer/show/approve`;
+the holdout red-team items hold; 3007 tests, 100% branch coverage on Python 3.12 and 3.14. The
+opt-in live check passed on Haiku 5.5 for $0.02 (2026-11-14): 9 criteria (4 change, 5 keep), 9
+visible tests and 14 probes accepted on the first attempt, all of them green on a known-good
+implementation. The first live run ($0.06) had found the two gaps fixed in spec amendment C:
+"keep today's behaviour" criteria, and tool caches committed from a worker's tree. Next: Phase 3.
 
 ### 14.1 Carried forward from the Phase 1a review
 
@@ -793,7 +811,7 @@ cover them.
 | 1b | Host code could follow a worker-produced symlink | Worker trees never land on the host: the box exports bundles, and gates and the verifier materialize trees inside the box |
 | 1b | Candidate-conflict paths are recorded only as transition text | Add structured `data` to `Ledger.transition` (as `update_task` already has) |
 | 2a | How a model-driven agent reaches its model | **Decided 2026-11-11: option A** (§5.3). Build `ClaudeAPIBackend`: host-side loop, box tools through `ToolExecutor`, no broker or proxy; add the option-A red-team items (§5.6) |
-| 3 | Black-box holdout probes need app + probe containers (§5.4), and the redaction red-team item | Build them with the holdout store and verify-ticket |
+| 3 | Black-box holdout probes need app + probe containers (§5.4), and the redaction red-team item | 2b builds the holdout store and CLI probes; Phase 3 adds HTTP probes in app + probe containers, redaction and verify-ticket |
 | 2b | Unsafe symlinks already in a target's base fail every task closed (`symlink_escape`) | `factory project add` detects and reports them when a repo is adopted |
 | 2b | `DiffPolicy.test_globs` are Python-only and not configurable | `[paths] test_globs` in `factory.toml` (needed for the notes-app JS/TS code) |
 | 4 | Gate-config edits that *remove* lines are invisible to the diff policy (it sees added lines only) | The factory runs coverage and mutation with its own config and `factory.toml [policy]` thresholds, so target-side config cannot weaken a gate |

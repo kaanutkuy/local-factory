@@ -18,8 +18,12 @@ action in a hardened, network-less container; red-team suite) complete. Phase 2a
 `ClaudeAPIBackend`: the model loop runs on the host on the official `anthropic` SDK, every tool
 call the model makes (Anthropic's bash and text-editor tools) runs in the box, and the API key
 never enters a container. It is verified end to end against an in-process fake of the API; the
-opt-in check against the real API (`pytest -m live`, spends tokens) is separate. Next: Phase 2b,
-Gate 1 (intake).
+opt-in check against the real API (`pytest -m live`, spends tokens) is separate. Phase 2b adds
+Gate 1: `factory intake "<request>"` runs triage, a spec writer, an ambiguity critic and a test
+architect; the visible acceptance tests are committed for implementers, the black-box holdout
+probes are sealed in factory state, each is shown to fail on the current code (or, for behaviour
+that must not change, to pass on it), and a human
+answers questions and approves the frozen contract (`factory questions/answer/show/approve`).
 The design, its rationale and the phase plan live in [`docs/PLAN.md`](docs/PLAN.md); the v0 bash
 loop is preserved at the `legacy-v0` tag.
 
@@ -41,6 +45,8 @@ Requires [uv](https://docs.astral.sh/uv/) and git ≥ 2.38.
 ```sh
 uv sync                 # create the environment
 uv run factory --help   # CLI
+uv run factory project add PATH        # adopt a target repo (needs factory.toml with [commands] acceptance)
+uv run factory intake "<request>"      # Gate 1: request -> proposed contract (needs ANTHROPIC_API_KEY, Docker)
 scripts/verify          # ruff, ruff format, mypy --strict, pytest with ≥90% branch coverage
 uv run pytest -m live   # opt-in: a real model on fixture tasks; needs ANTHROPIC_API_KEY, spends tokens
 ```

@@ -19,7 +19,7 @@ import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-from local_factory.config import PROJECT_CONFIG_FILENAME, ProjectConfig
+from local_factory.config import DEFAULT_TEST_GLOBS, PROJECT_CONFIG_FILENAME, ProjectConfig
 from local_factory.models import (
     MODE_EXECUTABLE,
     MODE_GITLINK,
@@ -33,9 +33,8 @@ from local_factory.models import (
 )
 from local_factory.policy.globs import glob_match
 
-__all__ = ["DiffPolicy", "check_changes", "glob_match"]
+__all__ = ["DEFAULT_TEST_GLOBS", "DiffPolicy", "check_changes", "glob_match"]
 
-DEFAULT_TEST_GLOBS: tuple[str, ...] = ("tests/**", "**/test_*.py", "**/*_test.py")
 DEFAULT_MAX_FILE_BYTES = 1_000_000
 
 PROTECTED_PATH = "protected_path"
@@ -167,8 +166,11 @@ class DiffPolicy:
 
     @classmethod
     def from_project(cls, config: ProjectConfig) -> DiffPolicy:
-        """The project's protected globs; ``factory.toml`` is protected no matter what."""
-        return cls(protected=tuple(dict.fromkeys((*config.protected, PROJECT_CONFIG_FILENAME))))
+        """The project's protected and test globs; ``factory.toml`` is protected no matter what."""
+        return cls(
+            protected=tuple(dict.fromkeys((*config.protected, PROJECT_CONFIG_FILENAME))),
+            test_globs=config.test_globs,
+        )
 
 
 def check_changes(

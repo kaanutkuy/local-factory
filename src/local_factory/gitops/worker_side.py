@@ -21,6 +21,10 @@ from .bare import absolute, check_ref_name
 
 TASK_BRANCH = "task"
 TASK_REF = f"refs/heads/{TASK_BRANCH}"
+# Tool caches a worker's own commands leave behind (running tests writes __pycache__). They are
+# excluded from `commit_all` so an honest worker never commits them. A convenience, not a
+# boundary: a worker can edit its own .git, and the policy checks remain the boundary.
+WORKER_EXCLUDES = ("__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/")
 _SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 STDOUT_FD = 1
 
@@ -40,10 +44,18 @@ def init_from_bundle(bundle: Path, ref: str, dest: Path) -> None:
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise FileExistsError(f"worker destination exists and is not empty: {target}")
     run_git(["init", "--quiet", "--initial-branch=main", str(target)])
+    _write_excludes(target)
     fetch = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"]
     fetch += ["--end-of-options", str(absolute(bundle)), f"{ref}:{TASK_REF}"]
     run_git(fetch, git_dir=_git_dir(target), cwd=target)
     run_git(["switch", "--quiet", TASK_BRANCH], git_dir=_git_dir(target), cwd=target)
+
+
+def _write_excludes(work: Path) -> None:
+    """List the caches in ``info/exclude``: untracked ones are never staged, tracked files are."""
+    info = _git_dir(work) / "info"
+    info.mkdir(exist_ok=True)
+    (info / "exclude").write_text("".join(f"{pattern}\n" for pattern in WORKER_EXCLUDES))
 
 
 def commit_all(work: Path, message: str) -> str | None:

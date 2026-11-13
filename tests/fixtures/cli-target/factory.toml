@@ -4,6 +4,8 @@ name = "cli-target"
 [commands]
 lint = "python3 -m py_compile greet.py slugify.py"
 unit = "python3 -m unittest discover -s tests -q"
+# Gate 1 runs one visible acceptance test with this ({path} and {name} are shell-quoted)
+acceptance = "python3 -m unittest {path} -k {name}"
 
 [paths]
 protected = ["tests/acceptance/**", "factory.toml"]

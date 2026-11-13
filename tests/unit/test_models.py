@@ -22,6 +22,8 @@ from local_factory.models import (
     ChangeKind,
     Contract,
     Criterion,
+    CriterionDraft,
+    CriterionKind,
     CriterionResult,
     CriterionStatus,
     Event,
@@ -31,8 +33,12 @@ from local_factory.models import (
     Halt,
     HaltReason,
     MigrationImpact,
+    ProbeDraft,
+    ProbeExpectation,
+    RedCheck,
     RiskTier,
     RunRecord,
+    SpecDraft,
     Task,
     TaskStatus,
     TestLayer,
@@ -43,6 +49,7 @@ from local_factory.models import (
     Usage,
     Verdict,
     Violation,
+    VisibleTest,
     Waiver,
 )
 
@@ -533,3 +540,81 @@ def test_enum_values() -> None:
 def test_test_layer_is_not_collected_by_pytest() -> None:
     assert TestLayer.__test__ is False
     assert [layer.value for layer in TestLayer] == ["unit", "integration", "e2e"]
+
+
+# --------------------------------------------------------------------------- Gate 1 (Phase 2b)
+
+
+def test_a_probe_must_expect_something() -> None:
+    assert ProbeExpectation(exit_code=0).exit_code == 0
+    assert ProbeExpectation(stdout="").stdout == ""  # an empty stdout is an expectation
+    with pytest.raises(ValidationError, match="must expect"):
+        ProbeExpectation()
+    with pytest.raises(ValidationError, match="must not be empty"):
+        ProbeExpectation(stdout_contains=("ok", ""))
+
+
+@pytest.mark.parametrize(
+    ("argv", "stdin", "message"),
+    [
+        (("python3", "a\0b"), "", "argv must not contain NUL"),
+        (("python3",), "in\0put", "stdin must not contain NUL"),
+        (("python3", ""), "", "1..1000 characters"),
+        (("python3", "x" * 1001), "", "1..1000 characters"),
+    ],
+)
+def test_a_probe_argv_is_well_formed(argv: tuple[str, ...], stdin: str, message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ProbeDraft(criteria=("AC-1",), argv=argv, stdin=stdin, expect=ProbeExpectation(exit_code=0))
+
+
+def test_visible_test_ids_name_a_path_and_a_test() -> None:
+    ok = VisibleTest(test="tests/acceptance/T-0001/test_a.py::Case.test_b", criteria=("AC-1",))
+    assert ok.test.endswith("::Case.test_b")
+    for bad in ("tests/a.py", "::test_b", "tests/a.py::", "tests/a.py:: x"):
+        with pytest.raises(ValidationError):
+            VisibleTest(test=bad, criteria=("AC-1",))
+
+
+def test_a_criterion_is_a_change_unless_it_says_keep() -> None:
+    draft = CriterionDraft(ears="e", layer=TestLayer.UNIT, test_plan="p")
+    assert draft.kind is CriterionKind.CHANGE
+    assert Criterion(id="AC-1", ears="e", layer=TestLayer.UNIT).kind is CriterionKind.CHANGE
+    kept = CriterionDraft.model_validate(
+        {"ears": "e", "layer": "unit", "test_plan": "p", "kind": "keep"}
+    )
+    assert kept.kind is CriterionKind.KEEP
+    with pytest.raises(ValidationError):
+        CriterionDraft.model_validate({"ears": "e", "layer": "unit", "test_plan": "p", "kind": "x"})
+
+
+def test_a_spec_needs_a_change_criterion() -> None:
+    change = CriterionDraft(ears="e", layer=TestLayer.UNIT, test_plan="p")
+    keep = change.model_copy(update={"kind": CriterionKind.KEEP})
+    assert len(SpecDraft(summary="s", criteria=(keep, change)).criteria) == 2
+    with pytest.raises(ValidationError, match="at least one change criterion"):
+        SpecDraft(summary="s", criteria=(keep, keep))
+
+
+@pytest.mark.parametrize(
+    ("red", "green", "keep", "ok"),
+    [
+        (True, False, False, True),
+        (False, True, False, False),
+        (False, False, False, False),
+        (True, False, True, False),
+        (False, True, True, True),
+        (False, False, True, False),
+    ],
+)
+def test_a_red_check_is_ok_when_it_meets_its_kind(
+    red: bool, green: bool, keep: bool, ok: bool
+) -> None:
+    check = RedCheck(kind="visible", id="t.py::x", red=red, green=green, keep=keep, reason="r")
+    assert check.ok is ok
+
+
+def test_a_red_check_is_never_red_and_green() -> None:
+    assert RedCheck(kind="holdout", id="HP-1", red=True, reason="r").green is False
+    with pytest.raises(ValidationError, match="both red and green"):
+        RedCheck(kind="holdout", id="HP-1", red=True, green=True, reason="r")

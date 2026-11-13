@@ -59,6 +59,29 @@ SYSTEM_ACTOR = "factory"
 
 _SIGNATURE_PATTERN = re.compile(r"[0-9a-f]+")
 
+# Event kinds the ledger writes itself. `record_event` refuses them, so each keeps meaning exactly
+# what the ledger says it means: nobody else can append a `transition` that moved nothing, or a
+# `contract_frozen` for a contract that was never frozen.
+RESERVED_EVENT_KINDS = frozenset(
+    {
+        "created",
+        "transition",
+        "contract_proposed",
+        "oracle_version_set",
+        "contract_frozen",
+        "halted",
+        "resumed",
+        "task_created",
+        "task_updated",
+        "run_recorded",
+        "verdict_recorded",
+        "evidence_recorded",
+        "triaged",
+    }
+)
+
+_PROPOSABLE = frozenset({TicketStatus.TRIAGED, TicketStatus.NEEDS_INFO})
+
 _NEXT_SEQ = {
     "events": "SELECT COALESCE(MAX(seq), 0) + 1 FROM events",
     "runs": "SELECT COALESCE(MAX(seq), 0) + 1 FROM runs",
@@ -186,6 +209,43 @@ class Ledger:
                 ticket, to, actor=actor, reason=reason, data=data, now=self._clock()
             )
 
+    def triage(
+        self,
+        ticket_id: str,
+        *,
+        title: str,
+        type: TicketType,
+        risk: RiskTier,
+        actor: str,
+        data: Mapping[str, JsonValue] | None = None,
+    ) -> Ticket:
+        """RECEIVED -> TRIAGED with the triage result: title, type and risk set, a `triaged`
+        event (`data` plus `title`, `type` and `risk`) and the transition, in one transaction."""
+        with self._transaction():
+            ticket = self._load_ticket(ticket_id)
+            if ticket.status is not TicketStatus.RECEIVED:
+                raise IllegalTransition(
+                    f"{ticket_id}: only a received ticket can be triaged "
+                    f"(status is {ticket.status})"
+                )
+            now = self._clock()
+            triaged = self._save_ticket(ticket, now, title=title, type=type, risk=risk)
+            self._append_event(
+                at=now,
+                kind="triaged",
+                actor=actor,
+                ticket_id=ticket_id,
+                data={
+                    **(data or {}),
+                    "title": triaged.title,
+                    "type": triaged.type.value,
+                    "risk": triaged.risk.value,
+                },
+            )
+            return self._apply_transition(
+                triaged, TicketStatus.TRIAGED, actor=actor, reason="triaged", now=now
+            )
+
     # ------------------------------------------------------------------ contract
 
     def propose_contract(self, ticket_id: str, contract: Contract, *, actor: str) -> Ticket:
@@ -193,31 +253,43 @@ class Ledger:
         with self._transaction():
             ticket = self._load_ticket(ticket_id)
             _ensure_not_frozen(ticket)
-            now = self._clock()
-            updated = self._save_ticket(ticket, now, contract=contract)
-            self._append_event(
-                at=now,
-                kind="contract_proposed",
-                actor=actor,
-                ticket_id=ticket_id,
-                data={"version": contract.version, "contract_hash": content_hash(contract)},
-            )
-        return updated
+            return self._store_contract(ticket, contract, now=self._clock(), actor=actor)
 
     def set_oracle_version(self, ticket_id: str, version: str, *, actor: str) -> Ticket:
         with self._transaction():
             ticket = self._load_ticket(ticket_id)
             _ensure_not_frozen(ticket)
+            return self._store_oracle_version(ticket, version, now=self._clock(), actor=actor)
+
+    def propose(
+        self, ticket_id: str, contract: Contract, oracle_version: str, *, actor: str
+    ) -> Ticket:
+        """Gate 1's proposal: store the contract and its oracle version and move the ticket to
+        CONTRACT_PROPOSED, in one transaction.
+
+        Only from TRIAGED or NEEDS_INFO, and only while the contract is not frozen. The events
+        are the ones :meth:`propose_contract` and :meth:`set_oracle_version` write, followed by
+        the transition.
+        """
+        with self._transaction():
+            ticket = self._load_ticket(ticket_id)
+            _ensure_not_frozen(ticket)
+            if ticket.status not in _PROPOSABLE:
+                raise IllegalTransition(
+                    f"{ticket_id}: a contract can only be proposed in "
+                    f"{' or '.join(sorted(_PROPOSABLE))} (status is {ticket.status})"
+                )
+            self._check(ticket, TicketStatus.CONTRACT_PROPOSED)
             now = self._clock()
-            updated = self._save_ticket(ticket, now, oracle_version=version)
-            self._append_event(
-                at=now,
-                kind="oracle_version_set",
+            ticket = self._store_contract(ticket, contract, now=now, actor=actor)
+            ticket = self._store_oracle_version(ticket, oracle_version, now=now, actor=actor)
+            return self._apply_transition(
+                ticket,
+                TicketStatus.CONTRACT_PROPOSED,
                 actor=actor,
-                ticket_id=ticket_id,
-                data={"oracle_version": version},
+                reason="contract proposed",
+                now=now,
             )
-        return updated
 
     def freeze_contract(self, ticket_id: str, *, actor: str) -> Ticket:
         """Freeze contract + oracle version (hash recorded) and approve the ticket, atomically."""
@@ -310,6 +382,28 @@ class Ledger:
         return None if row is None else Halt.model_validate_json(row["body"])
 
     # ------------------------------------------------------------------ events
+
+    def record_event(
+        self,
+        ticket_id: str,
+        kind: str,
+        *,
+        actor: str,
+        data: Mapping[str, JsonValue] | None = None,
+    ) -> Event:
+        """Append an event of the caller's own kind to an existing ticket's log.
+
+        The ledger changes nothing else. Kinds the ledger writes itself
+        (:data:`RESERVED_EVENT_KINDS`) are refused with `ValueError`, so they keep meaning what the
+        ledger says; an unknown ticket is `TicketNotFound`.
+        """
+        if kind in RESERVED_EVENT_KINDS:
+            raise ValueError(f"event kind {kind!r} is written by the ledger itself")
+        with self._transaction():
+            self._load_ticket(ticket_id)
+            return self._append_event(
+                at=self._clock(), kind=kind, actor=actor, ticket_id=ticket_id, data=dict(data or {})
+            )
 
     def events(self, ticket_id: str | None = None) -> list[Event]:
         """All events (or one ticket's), ordered by the global sequence number."""
@@ -637,6 +731,32 @@ class Ledger:
         )
         return updated
 
+    def _store_contract(
+        self, ticket: Ticket, contract: Contract, *, now: datetime, actor: str
+    ) -> Ticket:
+        updated = self._save_ticket(ticket, now, contract=contract)
+        self._append_event(
+            at=now,
+            kind="contract_proposed",
+            actor=actor,
+            ticket_id=ticket.id,
+            data={"version": contract.version, "contract_hash": content_hash(contract)},
+        )
+        return updated
+
+    def _store_oracle_version(
+        self, ticket: Ticket, version: str, *, now: datetime, actor: str
+    ) -> Ticket:
+        updated = self._save_ticket(ticket, now, oracle_version=version)
+        self._append_event(
+            at=now,
+            kind="oracle_version_set",
+            actor=actor,
+            ticket_id=ticket.id,
+            data={"oracle_version": version},
+        )
+        return updated
+
     def _append_event(
         self,
         *,
@@ -647,7 +767,7 @@ class Ledger:
         from_status: TicketStatus | None = None,
         to_status: TicketStatus | None = None,
         data: dict[str, JsonValue] | None = None,
-    ) -> None:
+    ) -> Event:
         # Validate the complete event before writing it; a failure aborts the whole transaction.
         event = Event(
             seq=self._next_seq("events"),
@@ -674,6 +794,7 @@ class Ledger:
                 canonical_json(row["data"]).decode(),
             ),
         )
+        return event
 
 
 def _to_json(model: BaseModel) -> str:

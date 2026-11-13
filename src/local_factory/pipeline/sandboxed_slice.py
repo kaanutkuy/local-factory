@@ -27,13 +27,20 @@ from local_factory.gitops import BareRepo, BundleLimits, export_base_bundle
 from local_factory.hashing import utc_now
 from local_factory.ledger import Ledger
 from local_factory.models import GateResult
-from local_factory.pipeline.flow import Refused, SliceOutcome, Verification, Worker, run_slice
+from local_factory.pipeline.flow import (
+    Refused,
+    Site,
+    SliceOutcome,
+    Verification,
+    Worker,
+    run_slice,
+)
 from local_factory.sandbox import Sandbox
 from local_factory.sandbox.spec import BOX_WORK
 from local_factory.sandbox.workspace import TaskWorkspace
 from local_factory.verification import GateSpec
 
-__all__ = ["run_sandboxed_slice"]
+__all__ = ["box_site", "run_sandboxed_slice"]
 
 IMAGE_KEY = "sandbox"  # the key of the sandbox image in the evidence's image digests
 
@@ -83,6 +90,11 @@ async def run_sandboxed_slice(
 
 
 # --------------------------------------------------------------------------- the box site
+
+
+def box_site(sandbox: Sandbox) -> Site:
+    """The box site: every worker-side step and every gate runs in ``sandbox``'s containers."""
+    return _BoxSite(sandbox)
 
 
 class _BoxSite:
