@@ -40,15 +40,20 @@ _EXPORTS: dict[str, str] = {
     ),
     "LocalExecutor": "local",
     **dict.fromkeys(("CommandResult", "ToolError", "ToolExecutor"), "tools"),
+    **dict.fromkeys(("BOX_TOOLS", "BoxTools", "ToolOutcome"), "box_tools"),
+    "ClaudeAPIBackend": "claude_api",  # the only name that imports the `anthropic` SDK
 }
 
 __all__ = [
+    "BOX_TOOLS",
     "EFFORT_LEVELS",
     "Action",
     "AgentBackend",
     "AgentResult",
     "AgentTask",
+    "BoxTools",
     "Capability",
+    "ClaudeAPIBackend",
     "CommandResult",
     "DeleteFile",
     "Effort",
@@ -61,6 +66,7 @@ __all__ = [
     "RunCommand",
     "ToolError",
     "ToolExecutor",
+    "ToolOutcome",
     "WorkerHandle",
     "WriteFile",
 ]
@@ -77,6 +83,8 @@ if TYPE_CHECKING:
         RoleSpec,
         WorkerHandle,
     )
+    from local_factory.agents.box_tools import BOX_TOOLS, BoxTools, ToolOutcome
+    from local_factory.agents.claude_api import ClaudeAPIBackend
     from local_factory.agents.fake import (
         Action,
         DeleteFile,

@@ -14,3 +14,8 @@ build/
 
 # Local factory state must never live in this repo
 .local-factory/
+
+# Secrets never live in this repo: the API key comes from the factory's environment only
+.env
+.env.*
+*.pem

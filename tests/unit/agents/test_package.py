@@ -25,6 +25,10 @@ def test_every_export_resolves_to_its_defining_module(name: str) -> None:
         "CommandResult": "tools",
         "ToolError": "tools",
         "ToolExecutor": "tools",
+        "BOX_TOOLS": "box_tools",
+        "BoxTools": "box_tools",
+        "ToolOutcome": "box_tools",
+        "ClaudeAPIBackend": "claude_api",
     }.get(name)
     candidates = [defining] if defining else ["backend", "fake"]
     owners = [
@@ -73,3 +77,33 @@ def test_the_box_helpers_import_without_heavy_dependencies() -> None:
         timeout=60,
     )
     assert result.stdout == "[]\n", result.stderr
+
+
+def test_the_sdk_is_imported_only_by_the_claude_backend() -> None:
+    """The box imports agents.local under `python3 -I`; the SDK must never come with it, nor with
+    the package, the tools or the other backends. Only the Claude backend (lazily) loads it."""
+    code = (
+        "import sys, local_factory.agents as agents;"
+        "import local_factory.agents.local, local_factory.agents.box_tools;"
+        "agents.FakeBackend, agents.BoxTools, agents.ToolOutcome, agents.BOX_TOOLS;"
+        "before = 'anthropic' in sys.modules;"
+        "backend = agents.ClaudeAPIBackend;"
+        "print(before, 'anthropic' in sys.modules, backend.__module__)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        cwd=SRC,
+    )
+    assert result.stdout == "False True local_factory.agents.claude_api\n", result.stderr
+
+
+def test_the_box_tools_are_exported_from_the_package() -> None:
+    from local_factory.agents import BOX_TOOLS, BoxTools, ToolOutcome, box_tools
+
+    assert BOX_TOOLS is box_tools.BOX_TOOLS
+    assert BoxTools is box_tools.BoxTools
+    assert ToolOutcome is box_tools.ToolOutcome

@@ -147,10 +147,15 @@ class Task(FrozenModel):
 
 
 class HaltReason(StrEnum):
-    RATE_LIMIT = "rate_limit"
-    BILLING = "billing"
-    BUDGET = "budget"
-    MAX_TURNS = "max_turns"
+    """Why a run stopped without failing. A halt is never the worker's fault and never burns a
+    round; the scheduler resumes the ticket (at ``Halt.resume_at`` when known)."""
+
+    RATE_LIMIT = "rate_limit"  # the provider's rate limit outlasted the SDK's retries
+    BILLING = "billing"  # the provider refused for billing or spend-limit reasons
+    BUDGET = "budget"  # the factory's own budget for the run or ticket is spent
+    MAX_TURNS = "max_turns"  # the role's turn cap was reached
+    AUTH = "auth"  # no usable credential: missing, invalid, or lacking permission
+    UNAVAILABLE = "unavailable"  # overloaded, server or connection errors outlasted the retries
 
 
 class Halt(FrozenModel):

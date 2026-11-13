@@ -20,6 +20,7 @@ from local_factory.config import (
     DEFAULT_TIERS,
     FACTORY_CONFIG_FILENAME,
     PROJECT_CONFIG_FILENAME,
+    ClaudeConfig,
     ConfigError,
     FactoryConfig,
     ModelPrice,
@@ -356,6 +357,50 @@ def test_every_default_tier_model_has_a_default_price() -> None:
         ).estimate(above, 0)
 
 
+def test_cost_counts_cache_tokens_at_their_own_rates() -> None:
+    price = DEFAULT_PRICING["claude-sonnet-5-5"]
+    cost = price.cost(
+        input_tokens=1_000, output_tokens=500, cache_read_tokens=2_000, cache_write_tokens=400
+    )
+    assert cost == pytest.approx((1_000 * 2.0 + 500 * 10.0 + 2_000 * 0.10 + 400 * 2.50) / 1e6)
+    assert price.cost(input_tokens=1_000, output_tokens=500) == price.estimate(1_000, 500)
+
+
+def test_cache_rates_default_to_the_standard_multipliers() -> None:
+    price = ModelPrice(input=10.0, output=0.0)
+    assert price.cost(input_tokens=0, output_tokens=0, cache_write_tokens=1_000_000) == (
+        pytest.approx(12.5)
+    )
+    assert price.cost(input_tokens=0, output_tokens=0, cache_read_tokens=1_000_000) == (
+        pytest.approx(1.0)
+    )
+
+
+def test_long_context_is_decided_on_the_whole_prompt() -> None:
+    price = DEFAULT_PRICING["claude-haiku-5-5"]
+    short = price.cost(input_tokens=50_000, output_tokens=0, cache_read_tokens=50_000)
+    assert short == pytest.approx((50_000 * 0.10 + 50_000 * 0.01) / 1e6)
+    long = price.cost(
+        input_tokens=50_000, output_tokens=1_000, cache_read_tokens=50_000, cache_write_tokens=1
+    )
+    assert long == pytest.approx((50_000 * 0.50 + 1_000 * 2.50 + 50_000 * 0.05 + 0.625) / 1e6)
+    # A long request without explicit long cache rates derives them from the long input rate.
+    derived = ModelPrice(input=1.0, output=1.0, long_context_over=10, long_input=4.0)
+    assert derived.cost(input_tokens=0, output_tokens=0, cache_read_tokens=1_000_000) == (
+        pytest.approx(0.4)
+    )
+
+
+def test_default_cache_prices_match_the_published_rates() -> None:
+    rates = {m: (p.cache_write, p.cache_read) for m, p in DEFAULT_PRICING.items()}
+    assert rates == {
+        "claude-haiku-5-5": (0.125, 0.01),
+        "claude-sonnet-5-5": (2.50, 0.10),
+        "claude-opus-5-5": (5.00, 0.20),
+        "claude-fable-5-2": (10.00, 0.20),
+    }
+
+
 # =========================================================================== factory config
 
 
@@ -576,3 +621,43 @@ def test_factory_config_non_table_sections_are_config_errors(tmp_path: Path) -> 
         _write(home / FACTORY_CONFIG_FILENAME, text)
         wrong[name] = _outcome(partial(load_factory_config, home))
     assert {name: outcome for name, outcome in wrong.items() if outcome} == {}
+
+
+# --------------------------------------------------------------------------- [claude]
+
+
+def test_claude_defaults(tmp_path: Path) -> None:
+    claude = FactoryConfig(home=tmp_path).claude
+    assert claude == ClaudeConfig()
+    assert (claude.max_tokens, claude.max_retries, claude.compaction) == (64_000, 2, True)
+    assert claude.compaction_trigger_tokens == 150_000
+    assert (claude.max_run_cost_usd, claude.task_budget_tokens) == (None, None)
+    assert "api_key" not in ClaudeConfig.model_fields
+
+
+def test_claude_section_loads(tmp_path: Path) -> None:
+    _write(
+        tmp_path / FACTORY_CONFIG_FILENAME,
+        "[claude]\nmax_tokens = 32000\ncompaction = false\nmax_run_cost_usd = 2.5\n"
+        "task_budget_tokens = 40000\n",
+    )
+    claude = load_factory_config(tmp_path).claude
+    assert (claude.max_tokens, claude.compaction) == (32_000, False)
+    assert (claude.max_run_cost_usd, claude.task_budget_tokens) == (2.5, 40_000)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[claude]\napi_key = "sk-ant-nope"\n',
+        "[claude]\nmax_tokens = 10\n",
+        "[claude]\ncompaction_trigger_tokens = 1000\n",
+        "[claude]\ntask_budget_tokens = 100\n",
+        "[claude]\nmax_run_cost_usd = 0\n",
+        'claude = "x"\n',
+    ],
+)
+def test_claude_section_is_validated(tmp_path: Path, body: str) -> None:
+    _write(tmp_path / FACTORY_CONFIG_FILENAME, body)
+    with pytest.raises(ConfigError):
+        load_factory_config(tmp_path)

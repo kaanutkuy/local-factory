@@ -75,6 +75,9 @@ class AgentTask(FrozenModel):
     task_id: str | None = Field(default=None, pattern=TASK_ID_PATTERN)
     instructions: str
     context: dict[str, JsonValue] = Field(default_factory=dict)
+    # The run's spending cap in USD (the orchestrator splits a ticket's budget across runs); a
+    # backend that meters its own cost halts with HaltReason.BUDGET once it is reached.
+    max_cost_usd: float | None = Field(default=None, gt=0)
 
 
 @dataclass(frozen=True)

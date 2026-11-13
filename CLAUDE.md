@@ -15,9 +15,9 @@ changing code. This file is the map; those are the territory.
 ## Ownership and protected tests
 
 - Each implementer owns specific paths (listed in the phase spec). Touch nothing else.
-- `tests/acceptance/**` and `tests/redteam/**` are the oracle. They were written before the
-  implementation and are **protected**: never edit, skip, or delete them. If you believe an
-  acceptance test is wrong, stop and report why — the orchestrator decides.
+- `tests/acceptance/**`, `tests/redteam/**` and `tests/live/**` are the oracle. They were written
+  before the implementation and are **protected**: never edit, skip, or delete them. If you believe
+  an acceptance test is wrong, stop and report why — the orchestrator decides.
 - Never weaken a gate: no `skip`/`xfail`, no `# pragma: no cover`, no lowered thresholds. A
   `# type: ignore[code]` or `# noqa: CODE` needs an inline justification and a mention in your report.
 
@@ -46,5 +46,8 @@ changing code. This file is the map; those are the territory.
 - Container tests are marked `@pytest.mark.container` and need Docker plus the sandbox image
   (`scripts/build-images`). Without them they fail, never skip. Each test uses its own
   `DockerRuntime` and must leave no container or volume behind (`cleanup()` in the finalizer).
+- Live tests (`@pytest.mark.live`, `tests/live/`) call the real Claude API and spend money: they are
+  deselected by default and run only with `pytest -m live`, by the orchestrator, with the owner's
+  go-ahead. Everything else uses the in-process fake API (`tests/acceptance/claude_api_fake.py`).
 - Run only your own tests while iterating (`uv run pytest tests/unit/test_x.py`); run `ruff` and
   `mypy` on your own paths. Do not reformat files you don't own.

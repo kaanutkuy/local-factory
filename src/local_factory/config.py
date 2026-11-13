@@ -1,6 +1,7 @@
 """Factory-level and project-level configuration. Orchestrator-owned.
 
-- Factory config: ``$LOCAL_FACTORY_HOME/config.toml`` (tiers -> models, pricing, sandbox). Optional.
+- Factory config: ``$LOCAL_FACTORY_HOME/config.toml`` (tiers -> models, pricing, sandbox, the
+  Claude model loop). Optional.
 - Project config: ``factory.toml`` at the root of a target repo (commands, protected paths,
   policy thresholds, release policy). Required for every target; itself always protected.
 """
@@ -77,7 +78,19 @@ class ProjectConfig(FrozenModel):
 _PROJECT_SECTIONS = frozenset({"project", "commands", "paths", "policy", "release"})
 _PROJECT_KEYS = frozenset({"name"})
 _PATHS_KEYS = frozenset({"protected"})
-_FACTORY_KEYS = frozenset({"tiers", "pricing", "apex_enabled", "sandbox"})
+_FACTORY_KEYS = frozenset({"tiers", "pricing", "apex_enabled", "sandbox", "claude"})
+_CLAUDE_KEYS = frozenset(
+    {
+        "max_tokens",
+        "max_retries",
+        "request_timeout_s",
+        "compaction",
+        "compaction_trigger_tokens",
+        "max_tool_result_chars",
+        "max_run_cost_usd",
+        "task_budget_tokens",
+    }
+)
 _SANDBOX_KEYS = frozenset(
     {
         "image",
@@ -241,20 +254,56 @@ def load_project_config(path: Path) -> ProjectConfig:
 # --------------------------------------------------------------------------- factory config
 
 
+CACHE_WRITE_FACTOR = 1.25  # a 5-minute cache write, when no explicit rate is configured
+CACHE_READ_FACTOR = 0.1  # a cache hit, when no explicit rate is configured
+
+
 class ModelPrice(FrozenModel):
-    """USD per 1M tokens. Estimates only; the model broker meters actual spend."""
+    """USD per 1M tokens, as published by the provider.
+
+    The factory meters *tokens* from API responses (authoritative); cost is computed from these
+    configured prices, so it is as accurate as this table. ``long_*`` rates apply to a request
+    whose whole prompt (input + cache reads + cache writes) exceeds ``long_context_over``. Cache
+    rates default to the provider's standard multipliers of the matching input rate.
+    """
 
     input: float = Field(ge=0.0)
     output: float = Field(ge=0.0)
+    cache_write: float | None = Field(default=None, ge=0.0)  # 5-minute cache writes
+    cache_read: float | None = Field(default=None, ge=0.0)  # cache hits and refreshes
     long_context_over: int | None = Field(default=None, ge=1)
     long_input: float | None = Field(default=None, ge=0.0)
     long_output: float | None = Field(default=None, ge=0.0)
+    long_cache_write: float | None = Field(default=None, ge=0.0)
+    long_cache_read: float | None = Field(default=None, ge=0.0)
 
-    def estimate(self, input_tokens: int, output_tokens: int) -> float:
-        long = self.long_context_over is not None and input_tokens > self.long_context_over
+    def cost(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+    ) -> float:
+        """USD for one request (one sampling iteration) with these token counts."""
+        prompt = input_tokens + cache_read_tokens + cache_write_tokens
+        long = self.long_context_over is not None and prompt > self.long_context_over
         rate_in = self.long_input if long and self.long_input is not None else self.input
         rate_out = self.long_output if long and self.long_output is not None else self.output
-        return (input_tokens * rate_in + output_tokens * rate_out) / 1_000_000
+        write = self.long_cache_write if long else self.cache_write
+        read = self.long_cache_read if long else self.cache_read
+        rate_write = write if write is not None else rate_in * CACHE_WRITE_FACTOR
+        rate_read = read if read is not None else rate_in * CACHE_READ_FACTOR
+        return (
+            input_tokens * rate_in
+            + output_tokens * rate_out
+            + cache_write_tokens * rate_write
+            + cache_read_tokens * rate_read
+        ) / 1_000_000
+
+    def estimate(self, input_tokens: int, output_tokens: int) -> float:
+        """``cost`` without cache tokens."""
+        return self.cost(input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 DEFAULT_TIERS: dict[str, dict[Tier, str]] = {
@@ -266,14 +315,42 @@ DEFAULT_TIERS: dict[str, dict[Tier, str]] = {
     }
 }
 
+# Anthropic's published first-party rates (platform.claude.com/docs/en/about-claude/pricing,
+# read 2026-11-13). Cache hits are 0.05x input on Opus/Sonnet 5.5 and 0.025x on Fable 5.2.
 DEFAULT_PRICING: dict[str, ModelPrice] = {
     "claude-haiku-5-5": ModelPrice(
-        input=0.10, output=0.50, long_context_over=100_000, long_input=0.50, long_output=2.50
+        input=0.10,
+        output=0.50,
+        cache_write=0.125,
+        cache_read=0.01,
+        long_context_over=100_000,
+        long_input=0.50,
+        long_output=2.50,
+        long_cache_write=0.625,
+        long_cache_read=0.05,
     ),
-    "claude-sonnet-5-5": ModelPrice(input=2.00, output=10.00),
-    "claude-opus-5-5": ModelPrice(input=4.00, output=20.00),
-    "claude-fable-5-2": ModelPrice(input=8.00, output=40.00),
+    "claude-sonnet-5-5": ModelPrice(input=2.00, output=10.00, cache_write=2.50, cache_read=0.10),
+    "claude-opus-5-5": ModelPrice(input=4.00, output=20.00, cache_write=5.00, cache_read=0.20),
+    "claude-fable-5-2": ModelPrice(input=8.00, output=40.00, cache_write=10.00, cache_read=0.20),
 }
+
+
+class ClaudeConfig(FrozenModel):
+    """The ``ClaudeAPIBackend`` model loop (docs/specs/phase-2a.md), ``[claude]`` in config.toml.
+
+    Models come from ``[tiers.claude]`` and prices from ``[pricing]``. There is deliberately no
+    key setting: the API key comes from the host environment of the factory process only, and
+    never enters a config file, the box, a transcript or the ledger.
+    """
+
+    max_tokens: int = Field(default=64_000, ge=1_024, le=128_000)  # per response (streamed)
+    max_retries: int = Field(default=2, ge=0, le=10)  # SDK retries (408/409/429/5xx/connection)
+    request_timeout_s: float = Field(default=900.0, gt=0.0)  # one HTTP request
+    compaction: bool = True  # server-side compaction at a token threshold
+    compaction_trigger_tokens: int = Field(default=150_000, ge=50_000)
+    max_tool_result_chars: int = Field(default=40_000, ge=1_000)  # per tool result and file view
+    max_run_cost_usd: float | None = Field(default=None, gt=0.0)  # when a task sets no budget
+    task_budget_tokens: int | None = Field(default=None, ge=20_000)  # advisory pacing (beta)
 
 
 def _default_tiers() -> dict[str, dict[Tier, str]]:
@@ -297,6 +374,7 @@ class FactoryConfig(FrozenModel):
     pricing: dict[str, ModelPrice] = Field(default_factory=lambda: dict(DEFAULT_PRICING))
     apex_enabled: bool = False
     sandbox: SandboxConfig = SandboxConfig()
+    claude: ClaudeConfig = ClaudeConfig()
 
     def model_for(self, backend: str, tier: Tier) -> str:
         if tier is Tier.APEX and not self.apex_enabled:
@@ -334,6 +412,7 @@ def load_factory_config(home: Path | None = None) -> FactoryConfig:
                 "pricing": {**DEFAULT_PRICING, **_table(raw, "pricing", str(path))},
                 "apex_enabled": raw.get("apex_enabled", False),
                 "sandbox": _table(raw, "sandbox", str(path), _SANDBOX_KEYS),
+                "claude": _table(raw, "claude", str(path), _CLAUDE_KEYS),
             }
         )
     except ValidationError as exc:

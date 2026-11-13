@@ -1,7 +1,8 @@
 # local-factory v1 — design and implementation plan
 
-Status: **proposal v1.3**, 2026-11-11 (v1.3: agent placement decided, **option A**: the model loop
-runs on the host and its tools execute in the box, see §5.3; v1.2: the Phase 1b box has no
+Status: **proposal v1.4**, 2026-11-13 (v1.4: Phase 2 split into 2a, the `ClaudeAPIBackend`, and
+2b, Gate 1; spec `docs/specs/phase-2a.md`; v1.3: agent placement decided, **option A**: the model
+loop runs on the host and its tools execute in the box, see §5.3; v1.2: the Phase 1b box has no
 network). Supersedes the v0 scenario/holdout loop (`factory/loop.sh`).
 Decisions recorded here came from an interview with the project owner plus one external design
 review; open decisions are listed in §15.
@@ -52,6 +53,9 @@ review; open decisions are listed in §15.
 | Agent placement | agent in the container, model via a broker | **Option A** (v1.3): model loop on the host with the official `anthropic` SDK; Anthropic's `bash` and text-editor tools execute in the box through `ToolExecutor` (§5.3). |
 | Credentials | broker with run-scoped tokens; broker metering authoritative | The API key exists only in the host process and never enters the box; the factory meters usage from API responses (§5.3, §10). |
 | Backend | `ClaudeAgentSDKBackend` | `ClaudeAPIBackend` (§11). The Claude Agent SDK is not used on the host (§5.3, rejected variant). |
+| Phase 2 | one phase | (v1.4) **2a** `ClaudeAPIBackend` + option-A red-team + opt-in `live` check; **2b** Gate 1 (§14). |
+| Role output | "structured output or a strict tool, decided in the Phase 2 spec" | (v1.4) a factory tool `submit_result` with `strict: true` (§5.3). |
+| Halts | rate limit, billing, budget, max turns | (v1.4) + `auth` (no usable key) and `unavailable` (overload/5xx/connection after the SDK's retries) (§10). |
 
 ---
 
@@ -261,9 +265,10 @@ weighed in A's favour. Phase 2 builds it; this section is the brief for the Phas
 **How A works**
 
 - The model loop runs in the factory process on the host, the only place the provider API key
-  exists. It calls the Claude API with the official **`anthropic` Python SDK** (MIT; added to
-  `pyproject.toml` by the orchestrator in Phase 2), through the SDK's tool runner or a small
-  factory-owned loop. The key comes from the host environment and is never passed to the docker CLI
+  exists. It calls the Claude API with the official **`anthropic` Python SDK** (Apache-2.0 since
+  the 2.x releases; added to `pyproject.toml` in Phase 2a), through a small factory-owned loop
+  (`agents/claude_api.py`): it owns budgets, metering, halts and the transcript, so the beta tool
+  runner is not used. The key comes from the host environment and is never passed to the docker CLI
   (`docker_env` is already minimal) or into any container.
 - Every tool call the model makes executes **in the box** through `ToolExecutor`
   (`agents/tools.py`; `SandboxExecutor` in production, `LocalExecutor` in tests). The box keeps
@@ -283,8 +288,10 @@ weighed in A's favour. Phase 2 builds it; this section is the brief for the Phas
   - A tool error goes back as a `tool_result` with `is_error: true` so the model can recover. A tool
     name the factory did not declare, or malformed input, is refused the same way. **Nothing the
     model asks for ever executes on the host.**
-  - Role outputs (e.g. `TaskReport`) come back as structured output (`output_config.format`) or a
-    factory-defined tool with `strict: true`; decided in the Phase 2 spec.
+  - Role outputs (e.g. `TaskReport`) come back through a factory-defined tool `submit_result`
+    whose `input_schema` is the role's output schema, with `strict: true` (decided in Phase 2a:
+    `output_config.format` would constrain every text block of an agentic loop, not just the
+    answer); the factory validates it again and returns errors for correction.
 
 **Why A, not B** (B = the whole agent, e.g. Claude Code via the Agent SDK, inside the box, reaching
 the model through a key-injecting broker and an egress proxy over an internal network)
@@ -297,7 +304,8 @@ the model through a key-injecting broker and an egress proxy over an internal ne
 - **Portability:** `--network none` behaves the same on Linux, macOS Docker Desktop, WSL2 and
   rootless Docker. B relied on networking details that vary by Docker version and platform (§5.2
   measurements); for a public project each difference becomes a support issue.
-- **Dependencies and licensing:** A adds only `anthropic` (MIT). B needs the Claude Code binary in
+- **Dependencies and licensing:** A adds only `anthropic` (Apache-2.0; its dependencies are MIT,
+  BSD or Apache-2.0, checked 2026-11-13). B needs the Claude Code binary in
   the image (the Agent SDK "runs the Claude Code binary"), which is governed by Anthropic's
   Commercial Terms of Service, not an open-source license.
 - **Login is API key under either option:** "Unless previously approved, Anthropic does not allow
@@ -355,6 +363,15 @@ re-verify against the live docs when implementing)
   429 and 5xx (default 2 retries); handle `RateLimitError` / `retry-after` as a halt (§10).
 - On API version `2026-10-21`, `temperature` / `top_p` / `top_k` are rejected: never send them.
 - Docs: bash tool, text editor tool, tool runner, compaction, prompt caching, task budgets (Sources).
+
+**Re-verified for Phase 2a (2026-11-13; details in `docs/specs/phase-2a.md`).** `anthropic` 2.x
+sends API version `2026-10-21` by default and the key as `Authorization: Bearer`. Threshold
+compaction (`compact-2026-01-12`) reports its extra sampling step only in `usage.iterations`, so
+the factory meters the sum over iterations; cache hits cost 0.05x input on Opus/Sonnet 5.5 (in
+`DEFAULT_PRICING`). On-demand compaction (`compact-2026-09-04`) now exists too; threshold
+compaction is enough for 2a. Server-side refusal **fallbacks stay off**: they change the serving
+model inside a response (evidence binds role to model; cost is priced per model), so a refusal is
+an error with its category until the ledger can attribute iterations to models.
 
 GitHub and deploy credentials exist only in the release stage, which is deterministic host code.
 They are never in a container and never in any LLM context.
@@ -584,8 +601,10 @@ available, release hold.
   response's `usage` (authoritative: the box never touches it); per-run `max_turns`; the API's task
   budget (§5.3) only as an advisory pacing signal to the model.
 - **Halts:** a 429 that outlasts the SDK's retries (`RateLimitError`, `retry-after`) →
-  `halted(rate_limit, resets_at)`; a billing or authentication error → halt; budget exhausted →
-  `halted(budget)`. The scheduler resumes automatically.
+  `halted(rate_limit, resets_at)`; a billing error → `halted(billing)`; a missing, invalid or
+  unauthorized key → `halted(auth)`; overload, 5xx and connection errors after the retries →
+  `halted(unavailable)`; budget exhausted → `halted(budget)`. The scheduler resumes
+  automatically.
 - **Concurrency:** 1 until the sequential factory meets the Phase 6 reliability bar.
 - **Metrics (`factory stats`):** cost per accepted ticket, rounds to converge, escalation rate,
   human-intervention rate, escaped-defect rate, holdout catch rate, waiver rate, rollback rate.
@@ -635,10 +654,16 @@ frontier = "claude-opus-5-5"
 apex     = "claude-fable-5-2"     # disabled unless enabled explicitly
 
 [pricing]                          # USD per 1M tokens; the factory meters usage from API responses
-"claude-haiku-5-5"  = { input = 0.10, output = 0.50, long_context_over = 100_000, long_input = 0.50, long_output = 2.50 }
-"claude-sonnet-5-5" = { input = 2.00, output = 10.00 }
-"claude-opus-5-5"   = { input = 4.00, output = 20.00 }
-"claude-fable-5-2"  = { input = 8.00, output = 40.00 }
+"claude-haiku-5-5"  = { input = 0.10, output = 0.50, cache_write = 0.125, cache_read = 0.01, long_context_over = 100_000, long_input = 0.50, long_output = 2.50, long_cache_write = 0.625, long_cache_read = 0.05 }
+"claude-sonnet-5-5" = { input = 2.00, output = 10.00, cache_write = 2.50, cache_read = 0.10 }
+"claude-opus-5-5"   = { input = 4.00, output = 20.00, cache_write = 5.00, cache_read = 0.20 }
+"claude-fable-5-2"  = { input = 8.00, output = 40.00, cache_write = 10.00, cache_read = 0.20 }
+
+[claude]                           # config.ClaudeConfig: the ClaudeAPIBackend loop; no key setting
+max_tokens = 64_000                # per streamed response
+compaction_trigger_tokens = 150_000
+max_tool_result_chars = 40_000
+max_run_cost_usd = 2.0             # when a task sets no budget of its own
 
 [sandbox]                          # config.SandboxConfig; the box always has --network none
 image = "local-factory/sandbox:v1"
@@ -730,7 +755,8 @@ policy it imposes.
 | **0. Reset** | Tag `legacy-v0`; remove `factory/`, `greet.py`, `slugify.py` (greet/slugify → `tests/fixtures/`); uv skeleton; ruff + mypy + pytest; CI for this repo; README rewrite. | `uv run factory --help`; CI green |
 | **1a. Control plane** | models, ledger + state machine, config, `AgentBackend` + `FakeBackend`, bare repo + bundle export/import + validation, gate runner, diff policy, min-aggregation, evidence binding. | unit + integration tests green, including negative bundle tests |
 | **1b. Boundary — vertical slice** | the box: hardened, network-less containers for every worker action (`ToolExecutor`), worker git and export, gates (one fresh tree per gate); tmpfs task workspaces; the sandboxed slice; red-team suite v1. Spec: `docs/specs/phase-1b.md`. | **one ticket, one worker, one isolated container boundary, one commit, bundle import, one deterministic verification, one integration, evidence bound to the SHA (incl. the image digest)**, all with FakeBackend and $0 LLM spend; red-team suite v1: every check holds |
-| **2. Claude + Gate 1** | `ClaudeAPIBackend` (option A, §5.3: host-side loop on the `anthropic` SDK, Anthropic's bash + text-editor tools executed in the box) with the option-A red-team items and an opt-in `live` quality check; intake roles; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests; a real model completes a fixture task through the box with the API key never in the box |
+| **2a. Claude backend** | `ClaudeAPIBackend` (option A, §5.3: host-side loop on the `anthropic` SDK, Anthropic's bash + text-editor tools executed in the box through `ToolExecutor`) with the option-A red-team items and an opt-in `live` quality check. Spec: `docs/specs/phase-2a.md`. | the sandboxed slice reaches `candidate_verified` driven by `ClaudeAPIBackend` against an in-process fake API ($0); option-A red-team green (the key never in the box, no tool call acts on the host); opt-in: a real model completes fixture tasks through the box, judged by a hidden check |
+| **2b. Gate 1** | intake roles (triage, spec writer, ambiguity critic, test architect) on `ClaudeAPIBackend`; holdout store; red-first; CLI intake/questions/answer/show/approve; notes-app template; the §14.1 rows below marked 2b. | a prompt becomes an approved, frozen contract with red-verified visible + black-box holdout tests |
 | **3. Gate 2, single lane** *(highest priority)* | orchestrator, sequential implementer tasks, `verify_fast` + Stop gate, verify-ticket, redaction + leak scan, burn/rotate, escalation + stop rules, quality reviewer. | on a fixed benchmark of ≥5 notes-app tickets: converge rate recorded, ≥1 ticket needs >1 round and converges, zero holdout literals in any feedback, red-team still green. This proves **convergence**, not just execution. |
 | **4. Verification depth** | diff-scoped mutation, changed-line coverage, waivers, flake/session/data measures, blind per-AC behavioral check, Hypothesis, security reviewer. Metrics introduced one at a time with baselines. | a planted vacuous test and a planted wrong-expectation test are both caught; waiver flow audited end to end |
 | **5. Gate 3** | candidate squash + verify-ticket@SHA, commit statuses + branch protection, sha-pinned merge + tree-hash check, release policy (R2 hold, always-hold), migration linter + compatibility check + backup, canary + monitoring + auto-rollback, `factory pause`. **Needs the deploy-target decision.** | R1 ticket: prompt → prod with no human action after approval; R2 ticket holds; moving `main` during release forces re-verification (a stale pass is rejected); destructive migration is held; a broken deploy rolls back automatically |
@@ -747,8 +773,8 @@ every worker action, the worker's git, the export and every gate in network-less
 evidence bound to the sandbox image digest, and red-team suite v1 green; 2081 tests, 100% branch
 coverage on Python 3.12 and 3.14 (commit `04bc423`, CI green). App/probe containers moved to Phase 3.
 Agent placement was decided the same day: **option A** (§5.3); the broker and egress proxy are
-dropped. **Next: Phase 2**: write `docs/specs/phase-2.md` and its protected acceptance tests from
-§5.3 and this table's Phase 2 row (plus its §14.1 rows), then the agent team builds it.
+dropped. **Phase 2a** (2026-11-13): spec `docs/specs/phase-2a.md` and its protected acceptance
+tests are written; the agent team builds `ClaudeAPIBackend`. Next: Phase 2b (Gate 1).
 
 ### 14.1 Carried forward from the Phase 1a review
 
@@ -766,10 +792,10 @@ cover them.
 | 1b | Fresh per-gate `HOME` means cold tool caches (uv, pip, npm) | Mount read-only shared caches into gate containers explicitly |
 | 1b | Host code could follow a worker-produced symlink | Worker trees never land on the host: the box exports bundles, and gates and the verifier materialize trees inside the box |
 | 1b | Candidate-conflict paths are recorded only as transition text | Add structured `data` to `Ledger.transition` (as `update_task` already has) |
-| 2 | How a model-driven agent reaches its model | **Decided 2026-11-11: option A** (§5.3). Build `ClaudeAPIBackend`: host-side loop, box tools through `ToolExecutor`, no broker or proxy; add the option-A red-team items (§5.6) |
+| 2a | How a model-driven agent reaches its model | **Decided 2026-11-11: option A** (§5.3). Build `ClaudeAPIBackend`: host-side loop, box tools through `ToolExecutor`, no broker or proxy; add the option-A red-team items (§5.6) |
 | 3 | Black-box holdout probes need app + probe containers (§5.4), and the redaction red-team item | Build them with the holdout store and verify-ticket |
-| 2 | Unsafe symlinks already in a target's base fail every task closed (`symlink_escape`) | `factory project add` detects and reports them when a repo is adopted |
-| 2 | `DiffPolicy.test_globs` are Python-only and not configurable | `[paths] test_globs` in `factory.toml` (needed for the notes-app JS/TS code) |
+| 2b | Unsafe symlinks already in a target's base fail every task closed (`symlink_escape`) | `factory project add` detects and reports them when a repo is adopted |
+| 2b | `DiffPolicy.test_globs` are Python-only and not configurable | `[paths] test_globs` in `factory.toml` (needed for the notes-app JS/TS code) |
 | 4 | Gate-config edits that *remove* lines are invisible to the diff policy (it sees added lines only) | The factory runs coverage and mutation with its own config and `factory.toml [policy]` thresholds, so target-side config cannot weaken a gate |
 | 4 | Binary files are opaque to the diff policy | Flag new or modified binaries under source/test paths for verifier review |
 

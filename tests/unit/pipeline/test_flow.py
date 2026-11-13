@@ -7,10 +7,16 @@ import asyncio
 
 import pytest
 
-from local_factory.agents import AgentResult
-from local_factory.pipeline.flow import run_limited
+from local_factory.agents import BOX_TOOLS, AgentResult
+from local_factory.pipeline.flow import IMPLEMENTER_ROLE, VERIFIER_ROLE, run_limited
 
 OK = AgentResult(status="ok", text="done")
+
+
+def test_the_roles_that_work_in_the_box_declare_the_box_tools() -> None:
+    assert BOX_TOOLS == ("bash", "str_replace_based_edit_tool")
+    assert IMPLEMENTER_ROLE.tools == BOX_TOOLS
+    assert VERIFIER_ROLE.tools == BOX_TOOLS
 
 
 async def finishes() -> AgentResult:

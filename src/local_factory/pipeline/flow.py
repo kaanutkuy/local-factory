@@ -36,6 +36,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 
 from local_factory import __version__
 from local_factory.agents import (
+    BOX_TOOLS,
     AgentBackend,
     AgentResult,
     AgentTask,
@@ -115,6 +116,7 @@ IMPLEMENTER_ROLE = RoleSpec(
         "wrong, say so in your task report. Everything you leave in the working tree is committed "
         "for you."
     ),
+    tools=BOX_TOOLS,
 )
 VERIFIER_ROLE = RoleSpec(
     name="verifier",
@@ -126,6 +128,7 @@ VERIFIER_ROLE = RoleSpec(
         "report it exactly once as pass, fail or inconclusive, with evidence (and feedback for "
         "anything that does not pass). Change nothing."
     ),
+    tools=BOX_TOOLS,
 )
 
 SliceStatus = Literal[

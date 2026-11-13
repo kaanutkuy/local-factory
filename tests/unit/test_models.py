@@ -519,7 +519,14 @@ def test_enum_values() -> None:
     assert [t.value for t in TicketType] == ["bug", "feature", "chore"]
     assert [r.value for r in RiskTier] == ["R0", "R1", "R2"]
     assert [t.value for t in Tier] == ["fast", "standard", "frontier", "apex"]
-    assert {h.value for h in HaltReason} == {"rate_limit", "billing", "budget", "max_turns"}
+    assert {h.value for h in HaltReason} == {
+        "rate_limit",
+        "billing",
+        "budget",
+        "max_turns",
+        "auth",
+        "unavailable",
+    }
     assert len(TicketStatus) == 18
 
 

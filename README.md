@@ -14,9 +14,12 @@ the exact commit that ships.
 ```
 
 **Status:** v1 rewrite — Phases 0, 1a (control plane + host vertical slice) and 1b (every worker
-action in a hardened, network-less container; red-team suite) complete. Next is Phase 2: a Claude
-backend whose model loop runs on the host while every tool call it makes runs in the box, so the
-API key never enters a container. Nothing here drives a real model yet.
+action in a hardened, network-less container; red-team suite) complete. Phase 2a adds
+`ClaudeAPIBackend`: the model loop runs on the host on the official `anthropic` SDK, every tool
+call the model makes (Anthropic's bash and text-editor tools) runs in the box, and the API key
+never enters a container. It is verified end to end against an in-process fake of the API; the
+opt-in check against the real API (`pytest -m live`, spends tokens) is separate. Next: Phase 2b,
+Gate 1 (intake).
 The design, its rationale and the phase plan live in [`docs/PLAN.md`](docs/PLAN.md); the v0 bash
 loop is preserved at the `legacy-v0` tag.
 
@@ -39,7 +42,10 @@ Requires [uv](https://docs.astral.sh/uv/) and git ≥ 2.38.
 uv sync                 # create the environment
 uv run factory --help   # CLI
 scripts/verify          # ruff, ruff format, mypy --strict, pytest with ≥90% branch coverage
+uv run pytest -m live   # opt-in: a real model on fixture tasks; needs ANTHROPIC_API_KEY, spends tokens
 ```
+
+Container tests need Docker and the sandbox image (`scripts/build-images`).
 
 ## Layout
 
@@ -48,6 +54,8 @@ src/local_factory/     the factory (models, ledger, gitops, verification, policy
 tests/acceptance/      contract tests written before implementation (protected)
 tests/unit/            unit tests
 tests/integration/     tests against real git repositories
+tests/redteam/         attacks on the box and the model boundary that must fail (protected)
+tests/live/            opt-in checks against the real Claude API (protected, spends tokens)
 tests/fixtures/        fixture target repos (cli-target = v0's greet/slugify)
 docs/PLAN.md           design and phase plan
 docs/specs/            per-phase implementation specs
